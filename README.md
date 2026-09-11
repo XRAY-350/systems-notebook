@@ -25,6 +25,8 @@ copyright complications to work around in how it's described.
 |---|---|
 | [`mcfleet-rcon-pool/`](mcfleet-rcon-pool/) | A from-scratch, persistent Minecraft RCON client — one authenticated connection per server, reused for every command, instead of one per request. Cut a real production server's connection-churn log noise by 86% (the fix behind it is what caught the bug in the first place: reading the server's own log volume, not assuming "no errors" meant "no problem"). |
 | [`mcfleet-backup-retention/`](mcfleet-backup-retention/) | A 26-line grandfather-father-son backup retention policy, implemented as a pure stdin-filenames-in / stdout-delete-list-out filter. Validated against a synthetic 480-file, 40-day dataset before ever being trusted on real backups. |
+| [`gated-auto-update/`](gated-auto-update/) | A human-approve-once, apply-when-safe update state machine, generalized from a mod auto-updater: check for updates, one human click arms the plan, apply automatically the next safe window — with a hard guard against ever auto-applying a real version migration, and a failed apply's auto-rollback treated as a normal terminal outcome, not an error to keep retrying. |
+| [`format-era-migrator/`](format-era-migrator/) | Parse a command written in one of several historical, syntactically-different format eras into an era-agnostic spec, then recompile it in any target era — generalized from a command converter covering 22 Minecraft versions across 3 real historical data-format eras, with explicit tracking of anything a lossy conversion can't carry over. |
 
 **Community Platform** (moderation + engagement bot, two live communities)
 | Module | What it is |
