@@ -20,7 +20,7 @@ rg.save()                     # persist learned rate across process restarts
 
 ## Why this exists
 
-A version-monitoring service I built polls a public app-metadata API across many apps and many
+A version-monitoring service I run polls a public app-metadata API across many apps and many
 regional storefronts on a schedule, fanned out across a thread pool for throughput. At scale that
 fan-out produces a wide concurrent burst against a single origin, which its (undocumented) rate
 limiter doesn't like: sustained polling got the source IP rate-limited repeatedly. A *reactive*

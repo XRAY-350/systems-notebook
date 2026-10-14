@@ -1,12 +1,16 @@
 # systems-notebook
 
-Standalone, working code pulled out of production systems I built and operate, each with a short
+Standalone, working code pulled out of production systems I designed, direct and operate, each with a short
 write-up of the actual engineering problem it solves (not toy examples, real pieces extracted from
 real infrastructure and cleaned up to stand on their own).
 
 The full story behind each of these (the systems they came from, the incidents that shaped them,
 and a lot more that isn't code at all) is written up at
 **[sourcekit.org/portfolio](https://sourcekit.org/portfolio/)**.
+
+**Who wrote the code:** most of it was written by AI coding agents (Claude Code) working to my
+requirements, under operating rules I set. My part is the design calls, spotting problems, and the
+decisions. Where a module's story turns on who found or built something, its README says so.
 
 ## What's here
 

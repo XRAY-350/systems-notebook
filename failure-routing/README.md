@@ -21,7 +21,7 @@ person for a download failure, but the wrong one for a mod that no longer compil
 version. So most failures took an extra hop, and the person who could actually fix them heard about
 it last.
 
-The requirement, as it was given to me: different steps go to different owners ("download goes to
+My requirement, as I gave it to the agents: different steps go to different owners ("download goes to
 the pipeline's owner"), and each mod has different needs, "so this is something to determine, not a
 formula to apply as a blanket." So the rules live in a file, one entry per app, one recipient list
 per step.
@@ -31,8 +31,7 @@ per step.
 - **The pipeline marks its own phase.** Each stage writes a marker (DOWNLOAD, PATCH, BUILD,
   PUBLISH) before it starts, so a failure is attributed to the stage that was running, not guessed
   from the error text. Failing before any marker is reported as UNKNOWN, which goes to the default owner.
-- **A route is a proposal until its owner confirms it.** I drafted each app's routing from its
-  pipeline code, but an owner who never agreed to a route should not be woken by it. An unconfirmed
+- **A route is a proposal until its owner confirms it.** An agent drafted each app's routing from its pipeline code, but an owner who never agreed to a route should not be woken by it. An unconfirmed
   entry falls back to the default owner, and the message says which proposal was skipped. Each route
   went live only after its owner confirmed it.
 - **A shared library adds its owner only when the log blames it.** Several mods compile against
@@ -64,5 +63,5 @@ event, and it is the only way a mod compile error reaches the person who can fix
 - retryable failures stay quiet, while the dead-lettered one and forced tests are reported;
 - the messages share one thread.
 
-To show the tests can actually fail, I removed the "unconfirmed" gate from the router: the matching
+To show the tests can actually fail, the agent removed the "unconfirmed" gate from the router: the matching
 test failed. In production, each route type was proven with one forced failure on a dry run before it was relied on.

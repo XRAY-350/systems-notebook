@@ -10,8 +10,7 @@ convert('give @p sword{display:{Name:"Excalibur"}} 1', 'modern');
 // -> { command: 'give @p sword[custom_name="Excalibur"] 1', fromEra: 'legacy', toEra: 'modern', dropped: [] }
 ```
 
-This is a standalone, generalized version of the core algorithm behind a command converter I
-built into a native macOS app for Minecraft: paste a command written for an old game version and
+This is a standalone, generalized version of the core algorithm behind a command converter in a native macOS app for Minecraft that I directed (built by AI coding agents): paste a command written for an old game version and
 convert it to run on a current one, or the reverse, across three genuinely different command
 syntaxes the game has used historically for the exact same concepts (a raw NBT-tag block → a
 components-wrapped intermediate form → today's bracketed key=value form). The real implementation

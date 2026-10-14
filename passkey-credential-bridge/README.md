@@ -21,7 +21,7 @@ A's UI wasn't recognized by App B's login, and vice versa; annoying for a single
 wants one passkey to work everywhere, and a real gap if the operator ever needs to log in somewhere
 in a hurry and the "wrong" credential is the one their device offers first.
 
-## What I deliberately did NOT do
+## What was deliberately not done
 
 The obvious fixes are both worse than the one below:
 

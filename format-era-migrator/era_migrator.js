@@ -3,9 +3,10 @@
  * into an era-agnostic intermediate representation, then recompile it in any target era, with
  * explicit tracking of anything that doesn't survive the trip.
  *
- * This is a standalone, generalized version of the core algorithm behind a command converter I
- * built into a native macOS app for Minecraft: paste a command written for an old game version,
- * convert it to work on a new one (or vice versa), across THREE historically different command
+ * This is a standalone, generalized version of the core algorithm behind a command converter in
+ * a native macOS app for Minecraft that I directed (built by AI coding agents): paste a command
+ * written for an old game version, convert it to work on a new one (or vice versa), across THREE
+ * historically different command
  * syntaxes the game has used for the same concepts. The real implementation covers the game's full
  * item/entity data model; this version demonstrates the pattern with a small synthetic schema
  * instead, so it's runnable and testable on its own.

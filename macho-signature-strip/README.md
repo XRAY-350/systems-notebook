@@ -12,8 +12,7 @@ python3 macho_strip.py /path/to/binary-or-directory
 A build/re-signing pipeline I run needs to strip code signatures from Mach-O binaries as a step
 before re-packaging and re-signing them. Development happens on macOS, where `codesign` is right
 there. Production runs on Linux CI, which has no code-signing tools at all: no `codesign`, no
-`ldid`, nothing. The pipeline needed to behave identically on both, so I wrote the signature
-removal from scratch against Apple's own Mach-O load-command format instead of shelling out to a
+`ldid`, nothing. The pipeline needed to behave identically on both, so an AI agent wrote the signature removal from scratch against Apple's own Mach-O load-command format instead of shelling out to a
 platform-specific tool.
 
 ## What "remove a code signature" actually means
@@ -53,7 +52,7 @@ of those checks wrong and you'd silently corrupt a binary that happened to have 
 in what looked like padding. The function's failure mode is deliberately "do nothing": every guard
 that doesn't pass just returns the input unchanged, never a partial patch.
 
-## How I know it's correct
+## How it was proven correct
 
 This isn't validated by "it ran without an exception." Before this implementation replaced a
 different, slower signature-removal path in the real pipeline, both were run against the same real
