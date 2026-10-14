@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-reconciler.py — declarative infrastructure-state checking with self-heal, generalized from a
+reconciler.py: declarative infrastructure-state checking with self-heal, generalized from a
 server-reconciliation tool I run against production infrastructure.
 
 The idea: describe what SHOULD be true about a system in one small declarative manifest (a list of
-{name, live_path, source_path} entries — "this live file should match this source-of-truth file"),
+{name, live_path, source_path} entries: "this live file should match this source-of-truth file"),
 then check that manifest against actual reality and report exactly one of three outcomes per entry:
 
-    GREEN  — live matches source, nothing to do
-    RED    — live is missing or has drifted from source; a fix command is available and safe
-    YELLOW — the check itself couldn't run (e.g. the source file doesn't exist to compare against)
+    GREEN:  live matches source, nothing to do
+    RED:    live is missing or has drifted from source; a fix command is available and safe
+    YELLOW: the check itself couldn't run (e.g. the source file doesn't exist to compare against)
 
 Optionally APPLIES the safe fixes (copy source -> live) and re-checks, so routine drift heals
 itself silently, and only genuine, un-fixable problems surface for a human to see.
@@ -18,7 +18,7 @@ This is deliberately a generic, standalone version: the original tool also check
 (installed packages, file ownership, cron entries, running services, TLS certificate expiry) via
 a pluggable "run a command and inspect the result" abstraction over SSH-or-local execution. That
 plumbing is infrastructure-specific glue, left out here; what's shown is the core idea that
-generalizes — hash-based drift detection with a bounded, explicit, auditable fix path — reduced to
+generalizes (hash-based drift detection with a bounded, explicit, auditable fix path) reduced to
 its simplest real form: comparing local files.
 """
 from __future__ import annotations
@@ -62,7 +62,7 @@ def file_sha256(path: Path) -> str | None:
 
 
 def check_entry(entry: dict, report: Report) -> None:
-    """One manifest entry: {name, live_path, source_path}. Compares by content hash, not mtime —
+    """One manifest entry: {name, live_path, source_path}. Compares by content hash, not mtime:
     a file that was touched but never actually changed should read as GREEN, not RED."""
     live = Path(entry["live_path"])
     source = Path(entry["source_path"])
@@ -97,7 +97,7 @@ def reconcile(manifest: list[dict], apply_fixes: bool = False) -> Report:
     if not apply_fixes:
         return report
 
-    # Re-check only entries that had a fix applied — this keeps the report's meaning consistent
+    # Re-check only entries that had a fix applied: this keeps the report's meaning consistent
     # (GREEN really means "confirmed matching right now", not "matched before I tried to fix it").
     final = Report()
     for entry, finding in zip(manifest, report.findings):

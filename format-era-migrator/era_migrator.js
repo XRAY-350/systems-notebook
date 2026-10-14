@@ -1,5 +1,5 @@
 /**
- * era_migrator.js — parse a command/document written in one of several historical format "eras"
+ * era_migrator.js: parse a command/document written in one of several historical format "eras"
  * into an era-agnostic intermediate representation, then recompile it in any target era, with
  * explicit tracking of anything that doesn't survive the trip.
  *
@@ -12,14 +12,14 @@
  *
  * The pattern generalizes past games: any system that has changed its own serialization format
  * over time (a config file format, an API request shape, a save-file layout) faces the same
- * problem — given input in an unknown-but-detectable era, produce equivalent output in a target
+ * problem: given input in an unknown-but-detectable era, produce equivalent output in a target
  * era, and be honest about what couldn't be represented there.
  */
 
 const ERAS = ["legacy", "intermediate", "modern"];
 
 /**
- * Detect which era a raw command string was written in, from its own syntax shape — no external
+ * Detect which era a raw command string was written in, from its own syntax shape: no external
  * version metadata needed, the syntax itself is the signal (legacy uses a raw NBT-tag block,
  * intermediate wraps fields in a "components" object, modern uses bracketed key=value pairs).
  */
@@ -82,7 +82,7 @@ function parse(raw) {
 }
 
 /**
- * Recompile a spec in a target era's syntax. Some fields don't survive every trip — e.g. this toy
+ * Recompile a spec in a target era's syntax. Some fields don't survive every trip, e.g. this toy
  * schema's "legacy" era has no concept of a structured display-name style, only a raw string, so
  * compiling FROM a richer era TO legacy silently would lose information. `dropped` makes that
  * explicit instead of silent.

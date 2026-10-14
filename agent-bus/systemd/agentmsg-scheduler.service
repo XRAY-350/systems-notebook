@@ -1,0 +1,8 @@
+[Unit]
+Description=Deliver any agent-bus scheduled messages that have come due
+
+[Service]
+Type=oneshot
+User=agentbus
+EnvironmentFile=/etc/agentmsg.env
+ExecStart=/usr/local/bin/agentmsg dispatch-scheduled

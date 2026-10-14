@@ -1,0 +1,14 @@
+[Unit]
+Description=agent-bus wake daemon for %i (notices new mail, wakes the agent when it is idle)
+After=network.target
+
+[Service]
+Type=simple
+User=agentbus
+EnvironmentFile=/etc/agentmsg.env
+ExecStart=/usr/local/bin/agentmsg-watchd %i
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

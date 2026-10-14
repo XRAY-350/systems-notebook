@@ -1,11 +1,11 @@
 /**
- * gated_updater.js — a human-approve-once, apply-when-safe update state machine with a version-
+ * gated_updater.js: a human-approve-once, apply-when-safe update state machine with a version-
  * migration guard and auto-rollback on a failed apply.
  *
  * Standalone, generalized version of the core state machine behind a mod auto-updater I run for a
  * game server fleet: check daily for available updates, require a one-time human approval before
  * anything is touched, then apply automatically the next time the system is in a safe state to do
- * so (an empty server, in the original) — with a hard safety guard that refuses to auto-apply a
+ * so (an empty server, in the original), with a hard safety guard that refuses to auto-apply a
  * real version migration (as opposed to a routine same-version update), and an assumed
  * backup-and-verify apply step that can report a rollback. All I/O (checking for updates, checking
  * whether it's currently safe to apply, actually applying, persisting state) is injected, so this
@@ -25,11 +25,11 @@ const ARMED = "armed";
  *   True when it's currently safe to apply (e.g. the server has zero players online right now).
  * @param {() => Promise<{migrationRequired: boolean}>} deps.checkMigrationGuard
  *   Called right before applying. If migrationRequired is true, apply is REFUSED and the plan is
- *   disarmed — a version migration is a deliberate, by-hand decision, never something this
+ *   disarmed: a version migration is a deliberate, by-hand decision, never something this
  *   auto-applies, no matter how long it's been armed.
  * @param {() => Promise<"success"|"rolled_back"|"deferred">} deps.apply
  *   Actually applies the change set (with its own backup+verify+rollback internally) and reports
- *   the outcome. "deferred" means the safe window closed between the check and the apply attempt —
+ *   the outcome. "deferred" means the safe window closed between the check and the apply attempt,
  *   stay armed, try again next time.
  */
 function createGatedUpdater(deps) {
@@ -42,7 +42,7 @@ function createGatedUpdater(deps) {
       return { notified: false, reason: "no-changes" };
     }
     if (state.planSignature === plan.signature) {
-      // Same pending plan as last time we notified — don't re-notify (this is what stops a
+      // Same pending plan as last time we notified: don't re-notify (this is what stops a
       // periodic re-check from spamming a duplicate approval prompt for something unchanged).
       return { notified: false, reason: "already-notified" };
     }
@@ -76,10 +76,10 @@ function createGatedUpdater(deps) {
     const outcome = await deps.apply();
     if (outcome === "deferred") {
       // The safe window closed between our check above and the apply call actually starting
-      // (a real race — a player could join in that gap). Stay armed; the next tick tries again.
+      // (a real race: a player could join in that gap). Stay armed; the next tick tries again.
       return { attempted: true, outcome: "deferred" };
     }
-    // success or rolled_back are both TERMINAL for this plan — either it's applied, or it failed
+    // success or rolled_back are both TERMINAL for this plan: either it's applied, or it failed
     // and was safely undone. Either way there's nothing left to retry; disarm.
     state = { status: IDLE, planSignature: null, plan: null };
     return { attempted: true, outcome };

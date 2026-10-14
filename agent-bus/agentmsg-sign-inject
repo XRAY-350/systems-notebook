@@ -1,0 +1,29 @@
+#!/bin/bash
+# agentmsg-sign-inject <to-csv> <thread> <subject> <body> [--urgent] [--in-reply-to=<id>]
+#
+# The ONLY path by which the human's own decisions enter the bus as signed messages. Run it on the one host
+# that holds the human's private signing key (for example the chat bot that receives the human's button
+# presses and typed lines), through a narrow sudo rule so the bot process itself never reads the key:
+#   chatbot ALL=(root) NOPASSWD: /usr/local/bin/agentmsg-sign-inject
+# Every other host carries only the PUBLIC key (AGENTMSG_OWNER_SIGNERS), so an agent anywhere can verify an
+# order but no agent can forge one. Limit, stated plainly: root on the signing host can sign. This defends
+# against relayed and injected claims ("the human said yes"), not against a compromised signing host.
+set -u
+TO="${1:-}"; THREAD="${2:-owner-chat}"; SUBJECT="${3:-}"; BODY="${4:-}"; shift 4 2>/dev/null || true
+[ -n "$TO" ] || { echo "usage: agentmsg-sign-inject <to-csv> <thread> <subject> <body> [--urgent] [--in-reply-to=<id>]"; exit 2; }
+IFS=',' read -ra R <<< "$TO"
+for a in "${R[@]}"; do [[ "$a" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "bad recipient: $a"; exit 3; }; done   # agentmsg validates the list
+UFLAG=(); RFLAG=()
+for opt in "$@"; do
+  case "$opt" in
+    --urgent) UFLAG=(--urgent) ;;
+    --in-reply-to=*) id="${opt#--in-reply-to=}"; [[ "$id" =~ ^[0-9a-f]{6}$ ]] || { echo "bad reply id"; exit 3; }; RFLAG=(--in-reply-to "$id") ;;
+    *) echo "unknown option: $opt"; exit 3 ;;      # only these exact forms; the args come from a chat message
+  esac
+done
+export AGENTMSG_OWNER_SIGNKEY="${AGENTMSG_OWNER_SIGNKEY:-/etc/agentmsg-owner/owner_sign}"   # root 600, this host only
+[ -r "$AGENTMSG_OWNER_SIGNKEY" ] || { echo "signing key not readable: $AGENTMSG_OWNER_SIGNKEY"; exit 4; }
+STORE="${AGENTMSG_STORE:?set AGENTMSG_STORE to the bus store (local path or a mount of it)}"
+[ -d "$STORE" ] || { echo "bus store not reachable at $STORE"; exit 4; }   # fail fast; a dead mount must not hang the bot
+exec env AGENTMSG_STORE="$STORE" "${AGENTMSG_BIN:-agentmsg}" send --from owner "${UFLAG[@]}" "${RFLAG[@]}" \
+     --to "$TO" --thread "$THREAD" --subject "$SUBJECT" "$BODY"

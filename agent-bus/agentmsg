@@ -1,0 +1,1113 @@
+#!/usr/bin/env python3
+"""
+agentmsg: a file-backed message bus for several always-on AI coding agents and one human.
+
+Store layout (AGENTMSG_STORE, default ~/.agent-bus):
+  inbox/<agent>/     unread mail (the recipient's to-do list)
+  read/<agent>/      handled mail; the inbox -> read move IS the read receipt, stamped with read_at
+  sent/<agent>/      the sender's own copy
+  threads/<thread>/  the full conversation archive
+  scheduled/         deferred sends, invisible to recipients until dispatch-scheduled delivers them
+  held/              approval requests waiting on a signed human decision
+  attachments/<id>/  attachment bytes (messages carry only name, size, sha256)
+  announcements/     fleet-wide notices that ride along with each agent's next mail
+  board/<agent>.json one "what I am doing" line per agent
+  guard.log          every crossing-guard and secret-guard decision, for measurement
+
+One message = one JSON file, written atomically (tmp + rename), so a watcher never sees half a file.
+
+Configuration (environment):
+  AGENTMSG_STORE          store root
+  AGENTMSG_AGENTS         comma-separated agent names (else <store>/agents, one per line)
+  AGENTMSG_WATCHED        agents that have a wake daemon (agentmsg-watchd); default: all agents.
+                          The rest are pull-only: they see mail on their next `inbox`.
+  AGENT_NAME              who you are (or pass --from / --as)
+  AGENTMSG_TZ             IANA zone for timestamps and quiet hours (default: system local)
+  AGENTMSG_QUIET          quiet hours for wakes, "HH-HH" (default 03-07); --urgent ignores them
+  AGENTMSG_MIRROR_CMD     optional: a shell command that receives each message as JSON on stdin
+                          (secrets masked, attachments as name + size only), e.g. a chat-channel poster
+  AGENTMSG_OWNER_SIGNERS  OpenSSH allowed_signers file holding the human's PUBLIC key
+  AGENTMSG_OWNER_SIGNKEY  the human's PRIVATE signing key; set only by the inject helper on the one
+                          host that holds it
+  AGENTMSG_MAX_ATTACH_MB  per-message attachment cap (default 25)
+Test hooks: AGENTMSG_FAKE_NOW (ISO8601 "now"), AGENTMSG_NO_MIRROR=1.
+"""
+import argparse, hashlib, json, os, re, shlex, subprocess, sys, tempfile, uuid
+from datetime import datetime, timedelta
+
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo(os.environ["AGENTMSG_TZ"]) if os.environ.get("AGENTMSG_TZ") else None
+except Exception:
+    TZ = None
+
+STORE = os.path.expanduser(os.environ.get("AGENTMSG_STORE", "~/.agent-bus"))
+OWNER = "owner"                 # the human's bus identity; only ever trusted when signed (see owner_status)
+SYSTEM_SENDERS = ("announcements",)
+
+
+def _load_agents():
+    raw = os.environ.get("AGENTMSG_AGENTS", "")
+    if not raw:
+        try:
+            raw = ",".join(l.strip() for l in open(os.path.join(STORE, "agents")) if l.strip() and not l.startswith("#"))
+        except FileNotFoundError:
+            raw = ""
+    names = tuple(n.strip().lower() for n in raw.split(",") if n.strip())
+    bad = [n for n in names if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", n)]
+    if bad:   # names become directory names, so the charset is a path-traversal guard, not style
+        sys.exit(f"agentmsg: invalid agent name(s) {bad}: use lowercase letters, digits and single hyphens")
+    return names
+
+
+AGENTS = _load_agents()
+_w = os.environ.get("AGENTMSG_WATCHED")
+WATCHED = tuple(n.strip() for n in _w.split(",") if n.strip()) if _w is not None else AGENTS
+
+
+def known(n):
+    return n in AGENTS
+
+
+# --------------------------------------------------------------------------------------------------
+# SECRET GUARD. The bus is mirrored to a chat channel humans read, so a pasted credential would be
+# published. A send whose subject, body or attachments look like a credential is BLOCKED, naming what
+# matched (label and line, never the value). A deliberate override (--allow-secret "<reason>") is
+# logged and recorded on the message, and the mirror masks the secret anyway.
+# --------------------------------------------------------------------------------------------------
+MAX_ATTACH_BYTES = int(float(os.environ.get("AGENTMSG_MAX_ATTACH_MB", "25")) * 1024 * 1024)
+SECRET_PATTERNS = [
+    ("private key block", r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+    ("GitHub token", r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})"),
+    ("Anthropic key", r"\bsk-ant-[A-Za-z0-9_-]{20,}"),
+    ("Slack token", r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
+    ("AWS access key id", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    ("three-part bot token", r"\b[MN][A-Za-z0-9_-]{23,27}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,40}\b"),
+    ("bearer credential", r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{24,}"),
+    ("secret assignment", r"(?i)\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|CLIENT_SECRET)[A-Z0-9_]*\s*[=:]\s*['\"]?[^\s'\"<>]{8,}"),
+]
+_SECRET_RES = [(lbl, re.compile(rx)) for lbl, rx in SECRET_PATTERNS]
+
+
+def secret_findings(text, where):
+    out = []
+    for n, line in enumerate((text or "").splitlines(), 1):
+        for lbl, rx in _SECRET_RES:
+            if rx.search(line):
+                out.append((lbl, where, n))
+    return out
+
+
+def redact(text):
+    for lbl, rx in _SECRET_RES:
+        text = rx.sub("[redacted: %s]" % lbl, text or "")
+    return text
+
+
+def _human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+
+
+def _safe_name(name):
+    name = re.sub(r"[^A-Za-z0-9._+-]", "_", os.path.basename(name.strip()) or "file")
+    return name.lstrip(".") or "file"
+
+
+def gather_attachments(a):
+    files = []
+    for path in (getattr(a, "attach", None) or []):
+        if not os.path.isfile(path):
+            sys.exit(f"agentmsg: --attach {path}: no such file")
+        with open(path, "rb") as f:
+            files.append((_safe_name(path), f.read()))
+    if getattr(a, "attach_stdin", None):
+        data = sys.stdin.buffer.read()
+        if not data:   # almost always a piping mistake (stdin already consumed); refuse rather than send 0 bytes
+            sys.exit(f"agentmsg: --attach-stdin {a.attach_stdin}: stdin was EMPTY. For a deliberately empty file use --attach PATH.")
+        files.append((_safe_name(a.attach_stdin), data))
+    seen = set()
+    for i, (n, data) in enumerate(files):
+        base, k = n, 2
+        while n in seen:
+            n = "%s-%d" % (base, k); k += 1
+        seen.add(n); files[i] = (n, data)
+    return files
+
+
+def check_payload(me, a, subject, body, files):
+    """Size cap and secret scan, BEFORE anything is stored. Returns the override record or None."""
+    total = sum(len(d) for _, d in files)
+    allow_large = getattr(a, "allow_large", None)
+    if total > MAX_ATTACH_BYTES and not allow_large:
+        sys.exit(f"agentmsg: attachments total {_human_size(total)}, over the {_human_size(MAX_ATTACH_BYTES)} cap. "
+                 f'Send a link to the artifact instead, or: --allow-large "<reason>"')
+    finds = secret_findings(subject, "subject") + secret_findings(body, "body")
+    for n, d in files:
+        finds += secret_findings(d.decode("utf-8", errors="ignore"), "attachment " + n)
+    override = None
+    if finds:
+        where = sorted({"%s (%s line %d)" % f for f in finds})
+        allow = getattr(a, "allow_secret", None)
+        if not allow:
+            sys.exit("agentmsg: BLOCKED, this looks like it contains a credential:\n  " + "\n  ".join(where) +
+                     "\nPoint at where the secret is deployed instead of pasting it."
+                     '\nIf this is deliberate: --allow-secret "<reason>" (the mirror still masks it).')
+        override = {"reason": allow, "labels": sorted({f[0] for f in finds})}
+        _guard_log({"event": "secret_override", "from": me, "reason": allow, "labels": override["labels"]})
+    if allow_large and total > MAX_ATTACH_BYTES:
+        _guard_log({"event": "size_override", "from": me, "reason": allow_large, "bytes": total})
+    return override
+
+
+def store_attachments(mid, files):
+    meta = []
+    if not files:
+        return meta
+    d = os.path.join(STORE, "attachments", mid)
+    os.makedirs(d, exist_ok=True)
+    for n, data in files:
+        tmp = os.path.join(d, n + ".tmp")
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, 0o640)
+        os.rename(tmp, os.path.join(d, n))
+        meta.append({"name": n, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+    return meta
+
+
+# --------------------------------------------------------------------------------------------------
+# Time, identity, storage primitives
+# --------------------------------------------------------------------------------------------------
+def now():
+    fake = os.environ.get("AGENTMSG_FAKE_NOW")
+    dt = datetime.fromisoformat(fake) if fake else datetime.now().astimezone()
+    return dt.astimezone(TZ) if TZ else dt.astimezone()
+
+
+def _quiet():
+    m = re.fullmatch(r"(\d{1,2})-(\d{1,2})", os.environ.get("AGENTMSG_QUIET", "03-07"))
+    return (int(m.group(1)), int(m.group(2))) if m else (3, 7)
+
+
+def in_quiet_hours(dt):
+    start, end = _quiet()
+    return start <= dt.hour < end if start <= end else (dt.hour >= start or dt.hour < end)
+
+
+def quiet_hold_seconds(dt):
+    """Seconds until quiet hours end; 0 when not in them."""
+    if not in_quiet_hours(dt):
+        return 0
+    target = dt.replace(hour=_quiet()[1], minute=0, second=0, microsecond=0)
+    if target <= dt:
+        target += timedelta(days=1)
+    return max(1, int((target - dt).total_seconds()))
+
+
+def whoami():
+    n = os.environ.get("AGENT_NAME", "").strip().lower()
+    if known(n):
+        return n
+    sys.exit(f"agentmsg: cannot determine identity; set AGENT_NAME or pass --from (agents: {', '.join(AGENTS) or 'none configured'})")
+
+
+def identity(a):
+    """--from/--as wins, else $AGENT_NAME. VALIDATED against the agent list: the name becomes a directory
+    (inbox/<who>/, board/<who>.json), so an unchecked `--from ../x` would be a path traversal."""
+    who = (getattr(a, "frm", None) or "").strip().lower()
+    if who:
+        if not known(who):
+            sys.exit(f"agentmsg: unknown identity {who!r} (agents: {', '.join(AGENTS)})")
+        return who
+    return whoami()
+
+
+def sender(a):
+    """Senders may also be the human (via the inject helper, and trusted only if signed)."""
+    who = (getattr(a, "frm", None) or "").strip().lower()
+    if who == OWNER:
+        return OWNER
+    return identity(a)
+
+
+def ensure_dirs():
+    for sub in ("inbox", "read", "sent"):
+        for a in AGENTS:
+            os.makedirs(os.path.join(STORE, sub, a), exist_ok=True)
+    for sub in ("threads", "scheduled", "held"):
+        os.makedirs(os.path.join(STORE, sub), exist_ok=True)
+
+
+def atomic_write(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+    os.rename(tmp, path)
+
+
+def load(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def fname(msg):
+    ts = re.sub(r"[^0-9]", "", msg["ts"])[:14]
+    return f"{ts}-{msg['from']}-{msg['id']}.json"
+
+
+def _thread_ok(t):
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", t or "") or t.startswith("."):
+        sys.exit(f"agentmsg: bad thread name {t!r} (letters, digits, . _ - only)")
+    return t
+
+
+# --------------------------------------------------------------------------------------------------
+# Delivery
+# --------------------------------------------------------------------------------------------------
+def deliver(msg):
+    fn = fname(msg)
+    atomic_write(os.path.join(STORE, "threads", msg["thread"], fn), msg)
+    atomic_write(os.path.join(STORE, "sent", msg["from"], fn), msg)
+    if not msg.get("held"):        # a held approval request reaches nobody until the human's signed APPROVED
+        for a in msg["to"]:
+            if known(a):
+                atomic_write(os.path.join(STORE, "inbox", a, fn), msg)
+    mirror(msg)
+    release_held(msg)
+
+
+# HELD APPROVAL REQUESTS. When an agent asks the human to approve something addressed to OTHER agents, those
+# agents must not receive (or be woken by) the request before the human decides. It is stored held: thread copy,
+# sender copy and mirror (so the human sees it), no recipient inboxes. A SIGNED reply from the human whose subject
+# starts with APPROVED releases it, stamped with the approval id each recipient can `verify`. Anything else
+# (DENIED, a question, an unsigned "owner" reply) only marks it decided, or does nothing.
+def _held_path(mid):
+    return os.path.join(STORE, "held", f"{mid}.json")
+
+
+def release_held(reply):
+    if reply.get("from") != OWNER or not reply.get("in_reply_to"):
+        return
+    hp = _held_path(reply["in_reply_to"])
+    if not os.path.exists(hp):
+        return
+    held = load(hp)
+    if held.get("decided") or owner_status(reply) != "signed":
+        return
+    approved = (reply.get("subject") or "").strip().upper().startswith("APPROVED")
+    held.update(decided="approved" if approved else "not-approved", decided_by=reply["id"])
+    atomic_write(hp, held)
+    if not approved:
+        return
+    m = dict(held["msg"]); m.pop("held", None)
+    m["approved_by"] = reply["id"]
+    m["body"] = f"[APPROVED by the human: signed reply {reply['id']}; check with `agentmsg verify {reply['id']}`]\n\n" + m["body"]
+    fn = fname(m)
+    for a in m["to"]:
+        if known(a) and a != m["from"]:
+            atomic_write(os.path.join(STORE, "inbox", a, fn), m)
+    atomic_write(os.path.join(STORE, "threads", m["thread"], fn), m)
+    atomic_write(os.path.join(STORE, "sent", m["from"], fn), m)
+
+
+def _mirror_view(msg):
+    """What the mirror (a channel humans read) gets: secrets masked, attachment contents never, the signature
+    verdict instead of the signature blob."""
+    m = dict(msg)
+    m["subject"] = redact(m.get("subject", ""))
+    body = redact(m.get("body", ""))
+    if m.get("attachments"):
+        body += "\n" + "\n".join("attachment: %s (%s)" % (x["name"], _human_size(x["size"])) for x in m["attachments"])
+    if m.get("secret_override"):
+        body += "\n[sender overrode the secret guard: %s]" % m["secret_override"]["reason"]
+    m["body"] = body
+    m.pop("attachments", None)
+    m.pop("owner_sig", None)
+    m["owner_status"] = owner_status(msg)
+    return m
+
+
+def mirror(msg):
+    # Decided from the MESSAGE, not from the caller: a line the human typed in the chat channel itself
+    # (from owner, thread owner-chat) is already visible there, so echoing it back is a duplicate. An earlier
+    # design relied on the injecting caller to set a no-mirror flag; a second caller would have silently broken it.
+    if msg.get("from") == OWNER and msg.get("thread") == "owner-chat":
+        return
+    cmd = os.environ.get("AGENTMSG_MIRROR_CMD")
+    if not cmd or os.environ.get("AGENTMSG_NO_MIRROR") == "1":
+        return
+    try:
+        subprocess.run(cmd, shell=True, input=json.dumps(_mirror_view(msg)), text=True, timeout=15,
+                       stdout=subprocess.DEVNULL, check=True)
+    except Exception as e:   # the mirror is a convenience; a failure must never lose the message
+        sys.stderr.write(f"agentmsg: mirror failed (non-fatal): {e}\n")
+
+
+def find_msg(mid):
+    """(path, msg) for a message id (prefix ok), preferring exact id matches."""
+    if not re.fullmatch(r"[0-9a-f]{1,32}", mid or ""):
+        return None, None
+    hit = (None, None)
+    for root, _d, files in os.walk(STORE):
+        for fn in files:
+            if fn.endswith(".json") and re.search(r"-" + mid + r"[0-9a-f]*\.json$", fn):
+                p = os.path.join(root, fn)
+                try:
+                    m = load(p)
+                except Exception:
+                    continue
+                if m.get("id") == mid:
+                    return p, m
+                hit = hit if hit[0] else (p, m)
+    return hit
+
+
+def inbox_files(who):
+    d = os.path.join(STORE, "inbox", who)
+    return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".json")) if os.path.isdir(d) else []
+
+
+def mark_read(me, inbox_copy):
+    """Move the inbox copy to read/ (atomic; this IS the receipt), THEN stamp read_at. A rename preserves
+    mtime, so without the stamp "was this read before that reply was sent?" is unanswerable, and that is
+    exactly the question message crossing turns on. A failed stamp never costs the receipt itself."""
+    dst = os.path.join(STORE, "read", me, os.path.basename(inbox_copy))
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    os.rename(inbox_copy, dst)
+    try:
+        m = load(dst); m["read_at"] = now().isoformat(timespec="seconds"); atomic_write(dst, m)
+    except Exception:
+        pass
+    return dst
+
+
+# --------------------------------------------------------------------------------------------------
+# CROSSING GUARD + ACTIVITY BOARD. Two agents that each send before reading the other's last message
+# answer things the other has already moved past; both messages deliver fine, so nothing ever errors.
+# The fix lives at SEND time, the one place that knows what the sender has not read yet.
+# --------------------------------------------------------------------------------------------------
+GUARD_MAX_RECIPIENTS = 2      # broadcast mail (3+ recipients) is not a conversation and never blocks
+BOARD_STALE_HOURS = 12
+
+
+def _age_str(ts):
+    try:
+        secs = int((now() - datetime.fromisoformat(ts)).total_seconds())
+    except Exception:
+        return "?"
+    if secs < 90:
+        return f"{max(secs, 0)}s"
+    if secs < 5400:
+        return f"{secs // 60}m"
+    return f"{secs // 3600}h" if secs < 172800 else f"{secs // 86400}d"
+
+
+def _unread_from(who, senders, exclude_id=None):
+    out = []
+    for p in inbox_files(who):
+        try:
+            m = load(p)
+        except Exception:
+            continue
+        if m.get("from") in senders and m.get("id") != exclude_id and len(m.get("to", [])) <= GUARD_MAX_RECIPIENTS:
+            out.append(m)
+    return out
+
+
+def _guard_log(entry):
+    try:   # measurement only; must never break a send
+        entry["ts"] = now().isoformat(timespec="seconds")
+        os.makedirs(STORE, exist_ok=True)
+        with open(os.path.join(STORE, "guard.log"), "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def guard_crossing(me, to, force=False, exclude_id=None):
+    """HARD: I have unread mail from a recipient, so what I am about to say may be answered, contradicted or
+    superseded by it. Refuse and list it; --force overrides (logged). SOFT: a recipient has not read my
+    earlier message yet; note only. Applies to watched agents; the human and pull-only agents are exempt."""
+    if me not in WATCHED:
+        return
+    recips = [r for r in to if r != me]
+    pending = _unread_from(me, set(recips), exclude_id)
+    if pending:
+        ids = [m["id"] for m in pending]
+        if not force:
+            lines = "\n".join(f"  {m['id']}  {_age_str(m['ts']):>4} ago  {m['from']} [{m['thread']}] {m['subject']}" for m in pending)
+            _guard_log({"from": me, "to": recips, "action": "blocked", "unread": ids})
+            sys.exit(f"agentmsg: HOLD: {', '.join(sorted({m['from'] for m in pending}))} sent you {len(pending)} message(s) "
+                     f"you have not read:\n{lines}\nRead first (`agentmsg read <id>`); it may already answer or supersede "
+                     f"what you are about to send. If this is genuinely independent, add --force.")
+        _guard_log({"from": me, "to": recips, "action": "forced", "unread": ids})
+        print(f"note: --force used; still unread from {', '.join(recips)}: {', '.join(ids)}", file=sys.stderr)
+    for r in recips:
+        theirs = _unread_from(r, {me})
+        if theirs:
+            _guard_log({"from": me, "to": [r], "action": "noted", "unread": [m["id"] for m in theirs]})
+            print(f"note: {r} has not read your last {len(theirs)} message(s) yet (oldest {_age_str(theirs[0]['ts'])} "
+                  f"ago); consider folding this into one message.", file=sys.stderr)
+
+
+def _board_read(who):
+    try:
+        return load(os.path.join(STORE, "board", f"{who}.json"))
+    except Exception:
+        return None
+
+
+def _board_line(who, e):
+    try:
+        hours = (now() - datetime.fromisoformat(e["ts"])).total_seconds() / 3600
+    except Exception:
+        hours = 0
+    age = f"  (STALE {_age_str(e['ts'])}, may not be current)" if hours >= BOARD_STALE_HOURS else f"  ({_age_str(e['ts'])} ago)"
+    on = f"  on: {', '.join(e['resources'])}" if e.get("resources") else ""
+    return f"{who}: {e['doing']}{on}{age}"
+
+
+def wake_hint(me, to):
+    """State, at the moment of sending, how each recipient will notice. Written docs about who wakes whom
+    drifted and were re-read from stale copies; the CLI saying it every time does not drift."""
+    watched = [r for r in to if r in WATCHED and r != me]
+    pull = [r for r in to if r not in WATCHED and known(r) and r != me]
+    if watched:
+        print(f"wake: {', '.join(watched)}: automatic (agentmsg-watchd). Nothing else to do.", file=sys.stderr)
+    if pull:
+        print(f"wake: {', '.join(pull)}: pull-only, sees it on its next `agentmsg inbox`.", file=sys.stderr)
+
+
+def show_recipient_boards(me, to):
+    for r in to:
+        if r != me and known(r):
+            e = _board_read(r)
+            if e:
+                print(f"board: {_board_line(r, e)}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------------------------------
+# Input checks
+# --------------------------------------------------------------------------------------------------
+def read_body(a):
+    """Body from the argument, else stdin. `-` means stdin (an earlier version stored a literal "-" and
+    silently dropped the heredoc). Never block forever on a stdin that will not arrive."""
+    if a.body is not None and a.body.strip() != "-":
+        body = a.body
+    else:
+        import select
+        if sys.stdin.isatty() or not select.select([sys.stdin], [], [], 0.5)[0]:
+            sys.exit("agentmsg: no message body; pass it as an argument or pipe it on stdin.")
+        body = sys.stdin.read()
+    if not body.strip() or body.strip() in {"-", "--", "."}:
+        sys.exit("agentmsg: refusing to send an empty body.")
+    return body
+
+
+def _validate_to(to_arg):
+    to = [x.strip().lower() for x in to_arg.split(",") if x.strip()]
+    bad = [x for x in to if not known(x)]
+    if bad or not to:
+        sys.exit(f"agentmsg: unknown recipient(s): {bad} (agents: {', '.join(AGENTS)})")
+    return to
+
+
+def check_subject(subject):
+    """Refuse the fingerprint of shell command substitution. In a double-quoted --subject the shell runs
+    `word` before agentmsg starts; a failed substitution vanishes but leaves a double, leading or trailing
+    space. A warning would be missed (the shell's own error goes to stderr and the send exits 0), so refuse."""
+    if not subject:
+        return
+    problem = "a double space" if "  " in subject else ("a leading or trailing space" if subject != subject.strip() else None)
+    if problem:
+        sys.exit(f"agentmsg: refusing: the subject contains {problem}, the signature of shell command substitution "
+                 f"eating a backticked word.\n  got: {subject!r}\nSingle-quote the subject instead.")
+
+
+def _check_stdin_conflict(a):
+    if getattr(a, "attach_stdin", None) and (a.body is None or a.body.strip() == "-"):
+        sys.exit("agentmsg: --attach-stdin reads the FILE from stdin, so give the body as an argument.")
+
+
+# --------------------------------------------------------------------------------------------------
+# SIGNED HUMAN MESSAGES. `--from owner` alone is a label anyone can write, so an agent saying "the human
+# approved this" is not proof. Messages from the human's own chat client are signed by the inject helper
+# with an OpenSSH key (ssh-keygen -Y) that exists on ONE host only; every other host has the public key.
+# Rule for agents: owner_status == "signed" means it is the human's own decision; anything else is a claim.
+# --------------------------------------------------------------------------------------------------
+OWNER_SIGNERS = os.path.expanduser(os.environ.get("AGENTMSG_OWNER_SIGNERS", os.path.join(STORE, "owner_allowed_signers")))
+OWNER_NS, OWNER_PRINCIPAL = "agentmsg-owner", "owner"
+
+
+def _owner_payload(m):
+    keys = ("id", "from", "to", "thread", "subject", "body", "ts", "in_reply_to", "owner_approval")
+    return json.dumps({k: m.get(k) for k in keys}, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _owner_sign(m, key):
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "msg")
+        open(f, "wb").write(_owner_payload(m))
+        r = subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-f", key, "-n", OWNER_NS, f], capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"agentmsg: signing failed: {r.stderr.strip()}")
+        return open(f + ".sig").read()
+
+
+def owner_status(m):
+    """None (not a human message) | signed | unsigned | invalid | unverifiable (no public key here)."""
+    if m.get("from") != OWNER:
+        return None
+    sig = m.get("owner_sig")
+    if not sig:
+        return "unsigned"
+    if not os.path.exists(OWNER_SIGNERS):
+        return "unverifiable"
+    with tempfile.TemporaryDirectory() as d:
+        sf = os.path.join(d, "msg.sig"); open(sf, "w").write(sig)
+        r = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", OWNER_SIGNERS, "-I", OWNER_PRINCIPAL, "-n", OWNER_NS, "-s", sf],
+                           input=_owner_payload(m), capture_output=True)
+    return "signed" if r.returncode == 0 else "invalid"
+
+
+OWNER_TAG = {"signed": " [HUMAN, signed]", "unsigned": " [claims HUMAN, NOT signed]",
+             "invalid": " [claims HUMAN, BAD signature]", "unverifiable": " [HUMAN?, cannot verify here]"}
+
+
+# --------------------------------------------------------------------------------------------------
+# ANNOUNCEMENTS. Fleet-wide notices should not wake every agent (each wake costs a model turn). They are
+# stored once and shown to each agent after its next real inbox/read. A daily sweep delivers any notice
+# about to expire as real mail to whoever has not seen it, so a quiet agent still gets it.
+# --------------------------------------------------------------------------------------------------
+def _ann_dir():
+    return os.path.join(STORE, "announcements")
+
+
+def _ann_seen_path(who):
+    return os.path.join(_ann_dir(), "seen", f"{who}.json")
+
+
+def _ann_seen(who):
+    try:
+        return set(load(_ann_seen_path(who)))
+    except Exception:
+        return set()
+
+
+def _ann_all():
+    d, out = _ann_dir(), []
+    if not os.path.isdir(d):
+        return out
+    t = now()
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".json"):
+            try:
+                a = load(os.path.join(d, f))
+                if datetime.fromisoformat(a["expires"]) > t:
+                    out.append(a)
+            except Exception:
+                pass
+    return out
+
+
+def show_announcements(me):
+    seen = _ann_seen(me)
+    new = [a for a in _ann_all() if a["id"] not in seen and a.get("from") != me]
+    if not new:
+        return
+    sys.stdout.flush()
+    print("\n" + "=" * 60 + f"\n{len(new)} ANNOUNCEMENT(S) for all agents (shown once):")
+    for a in new:
+        print(f"\n[{a['id']}] {a['ts'][:16]} from {a['from']}: {a['subject']}\n{a['body']}")
+    print("=" * 60)
+    atomic_write(_ann_seen_path(me), sorted(seen | {a["id"] for a in new}))
+
+
+def cmd_announce(a):
+    me = sender(a)
+    check_subject(a.subject)
+    body = read_body(a)
+    check_payload(me, a, a.subject, body, [])
+    t = now()
+    ann = {"id": uuid.uuid4().hex[:6], "from": me, "to": ["all (on next mail)"], "thread": "announcements",
+           "subject": a.subject, "body": body, "ts": t.isoformat(timespec="seconds"),
+           "expires": (t + timedelta(days=a.days)).isoformat(timespec="seconds")}
+    atomic_write(os.path.join(_ann_dir(), f"{ann['ts'][:10]}-{ann['id']}.json"), ann)
+    mirror(ann)
+    print(f"announced {ann['id']} (expires {ann['expires'][:10]}); nobody is woken")
+
+
+def cmd_announce_sweep(a):
+    soon = now() + timedelta(hours=a.hours)
+    for ann in _ann_all():
+        if datetime.fromisoformat(ann["expires"]) > soon:
+            continue
+        missing = [w for w in AGENTS if w != ann.get("from") and ann["id"] not in _ann_seen(w)]
+        if not missing:
+            print(f"[{ann['id']}] everyone has seen it"); continue
+        if a.dry_run:
+            print(f"[{ann['id']}] would deliver to {', '.join(missing)}"); continue
+        ensure_dirs()
+        for who in missing:
+            deliver({"id": uuid.uuid4().hex[:6], "from": "announcements", "to": [who], "thread": "announcements",
+                     "subject": f"Unseen announcement (expires {ann['expires'][:10]}): {ann['subject']}",
+                     "body": ann["body"] + f"\n\n(announcement {ann['id']} from {ann['from']}; delivered directly before it expires)",
+                     "ts": now().isoformat(timespec="seconds"), "needs_reply": False, "urgent": False,
+                     "in_reply_to": None, "announcement_id": ann["id"]})
+            atomic_write(_ann_seen_path(who), sorted(_ann_seen(who) | {ann["id"]}))
+        print(f"[{ann['id']}] delivered to {', '.join(missing)}")
+
+
+def cmd_announcements(a):
+    anns = _ann_all()
+    if not anns:
+        print("(no current announcements)"); return
+    for x in anns:
+        print(f"[{x['id']}] {x['ts'][:16]} from {x['from']} (until {x['expires'][:10]}): {x['subject']}")
+        if a.full:
+            print(x["body"] + "\n")
+
+
+# --------------------------------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------------------------------
+def _new_msg(me, to, thread, subject, body, a, in_reply_to=None):
+    return {"id": uuid.uuid4().hex[:6], "from": me, "to": to, "thread": thread, "subject": subject or "",
+            "body": body, "ts": now().isoformat(timespec="seconds"), "needs_reply": bool(a.needs_reply),
+            "urgent": bool(a.urgent), "in_reply_to": in_reply_to}
+
+
+def _finish(msg, files, override):
+    if files:
+        msg["attachments"] = store_attachments(msg["id"], files)
+    if override:
+        msg["secret_override"] = override
+
+
+def cmd_send(a):
+    me = sender(a)
+    to = _validate_to(a.to)
+    thread = _thread_ok(a.thread)
+    check_subject(a.subject)
+    _check_stdin_conflict(a)
+    body = read_body(a)
+    files = gather_attachments(a)
+    override = check_payload(me, a, a.subject or "", body, files)
+    guard_crossing(me, to, force=a.force)
+    msg = _new_msg(me, to, thread, a.subject, body, a, a.in_reply_to)
+    if a.owner_approval:
+        msg.update(owner_approval=True, needs_reply=True)
+        if any(r != me for r in to):
+            msg["held"] = True
+    key = os.environ.get("AGENTMSG_OWNER_SIGNKEY")
+    if me == OWNER and key and os.path.exists(key):
+        msg["owner_sig"] = _owner_sign(msg, key)
+    ensure_dirs()
+    _finish(msg, files, override)
+    if msg.get("held"):
+        atomic_write(_held_path(msg["id"]), {"msg": msg, "created": msg["ts"]})
+    deliver(msg)
+    if not msg.get("held"):
+        show_recipient_boards(me, to)
+        wake_hint(me, to)
+    tag = OWNER_TAG.get(owner_status(msg), "") + (" [URGENT]" if msg["urgent"] else "") \
+        + (f" [APPROVAL requested: id {msg['id']}]" if msg.get("owner_approval") else "") \
+        + (" [HELD until the human approves]" if msg.get("held") else "") \
+        + (f" +{len(msg['attachments'])} attachment(s)" if msg.get("attachments") else "")
+    print(f"sent {msg['id']} -> {','.join(to)} (thread {thread}){tag}")
+
+
+def cmd_verify(a):
+    """Exit 0 only if EVERY stored copy of the message (inbox, read, sent, thread) is signed and verifies. Checking
+    just the first copy found would pass a message whose inbox copy, the one the agent actually reads, was altered."""
+    _p, m = find_msg(a.id)
+    if not m:
+        sys.exit(f"agentmsg: message {a.id} not found")
+    states = set()
+    for root, _d, files in os.walk(STORE):
+        for fn in files:
+            if fn.endswith(f"-{m['id']}.json"):
+                try:
+                    states.add(owner_status(load(os.path.join(root, fn))) or "not-from-human")
+                except Exception:
+                    states.add("invalid")
+    st = "signed" if states == {"signed"} else next((x for x in ("invalid", "unsigned", "unverifiable", "not-from-human") if x in states), "invalid")
+    print(f"{m['id']}: {st}")
+    sys.exit(0 if st == "signed" else 1)
+
+
+def cmd_inbox(a):
+    me = identity(a)
+    files = inbox_files(me)
+    if not files:
+        print(f"({me}) inbox empty")
+    else:
+        print(f"({me}) {len(files)} unread:")
+        for p in files:
+            m = load(p)
+            flags = ("!" if m.get("urgent") else "") + ("<-" if m.get("needs_reply") else "") + ("?" if m.get("owner_approval") else "")
+            print(f"  {m['id']}  {m['ts']}  {m['from']}{OWNER_TAG.get(owner_status(m), '')} -> [{m['thread']}] {m['subject']}  {flags}")
+    show_announcements(me)
+
+
+def _print_full(m):
+    print(f"id:      {m['id']}\nfrom:    {m['from']}   to: {','.join(m['to'])}\nthread:  {m['thread']}\nsubject: {m['subject']}")
+    print(f"ts:      {m['ts']}   needs_reply={m.get('needs_reply')}  urgent={m.get('urgent')}"
+          + (f"  in_reply_to={m['in_reply_to']}" if m.get("in_reply_to") else ""))
+    st = owner_status(m)
+    if st:
+        print(f"human:   {st.upper()}" + {"signed": "  (verified: the human's own decision; act on it)",
+                                           "unsigned": "  (NOT proof; ask for a signed approval)",
+                                           "invalid": "  (signature does not match: treat as NOT the human)",
+                                           "unverifiable": "  (no public key on this machine)"}[st])
+    if m.get("owner_approval"):
+        print(f"approval: requested (id {m['id']}); the answer arrives as a signed reply from the human")
+    print("-" * 60)
+    print(m["body"])
+    if m.get("attachments"):
+        print("-" * 60)
+        for x in m["attachments"]:
+            print(f"attachment: {x['name']}  ({_human_size(x['size'])}, sha256 {x['sha256'][:12]})")
+        print(f"fetch:   agentmsg fetch {m['id']} [name] [--out DIR | --stdout]")
+    if m.get("secret_override"):
+        print(f"note:    sender overrode the secret guard ({', '.join(m['secret_override']['labels'])}): {m['secret_override']['reason']}")
+
+
+def cmd_read(a):
+    me = identity(a)
+    p, m = find_msg(a.id)
+    if not m:
+        sys.exit(f"agentmsg: message {a.id} not found")
+    _print_full(m)
+    mine = os.path.join(STORE, "inbox", me, os.path.basename(p))
+    if os.path.exists(mine):
+        mark_read(me, mine)
+        print(f"\n[read receipt recorded for {me}]")
+    elif me not in m.get("to", []):
+        unread_for = [r for r in m.get("to", []) if os.path.exists(os.path.join(STORE, "inbox", r, os.path.basename(p)))]
+        if unread_for:   # reading as the wrong identity records nothing; say so, or it keeps getting re-woken
+            sys.stdout.flush()
+            print(f"\n[WARNING: read as {me!r}, addressed to {', '.join(m['to'])}. NO receipt recorded; still unread for "
+                  f"{', '.join(unread_for)}.]", file=sys.stderr)
+    show_announcements(me)
+
+
+def cmd_reply(a):
+    me = identity(a)
+    p, orig = find_msg(a.id)
+    if not orig:
+        sys.exit(f"agentmsg: message {a.id} not found")
+    _check_stdin_conflict(a)
+    body = read_body(a)
+    files = gather_attachments(a)
+    override = check_payload(me, a, "re: " + orig.get("subject", ""), body, files)
+    # Replying to your OWN message used to deliver into your own inbox while printing success. A self-reply
+    # means "follow up with the people I sent this to", so address it there and say so.
+    note = None
+    if orig["from"] == me:
+        recipients = [r for r in orig.get("to", []) if r != me]
+        if not recipients:
+            sys.exit(f"agentmsg: {a.id} is your own message with no other recipients; use send.")
+        note = f"note: {a.id} is your own message; replying to its recipients ({', '.join(recipients)})."
+    else:
+        recipients = [orig["from"]]
+    guard_crossing(me, recipients, force=a.force, exclude_id=orig["id"])
+    msg = _new_msg(me, recipients, orig["thread"], "re: " + orig.get("subject", ""), body, a, orig["id"])
+    ensure_dirs()
+    _finish(msg, files, override)
+    deliver(msg)
+    mine = os.path.join(STORE, "inbox", me, os.path.basename(p))
+    if os.path.exists(mine):
+        mark_read(me, mine)       # replying means the original was handled
+    if note:
+        print(note)
+    wake_hint(me, recipients)
+    print(f"replied {msg['id']} -> {', '.join(recipients)} (thread {msg['thread']})")
+
+
+def cmd_fetch(a):
+    """Copy attachments out of the store, verifying each sha256. --stdout writes one file's bytes, so a reader
+    on another machine can do: ssh <bus host> agentmsg fetch ID NAME --stdout > NAME"""
+    _p, m = find_msg(a.id)
+    if not m:
+        sys.exit(f"agentmsg: message {a.id} not found")
+    atts = [x for x in (m.get("attachments") or []) if not a.name or x["name"] == a.name]
+    if not atts:
+        sys.exit(f"agentmsg: {a.id} has no matching attachment")
+    if a.stdout and len(atts) != 1:
+        sys.exit("agentmsg: --stdout needs exactly one attachment; name it")
+    for x in atts:
+        src = os.path.join(STORE, "attachments", m["id"], x["name"])
+        if not os.path.isfile(src):
+            sys.exit(f"agentmsg: attachment missing from the store: {x['name']}")
+        data = open(src, "rb").read()
+        if hashlib.sha256(data).hexdigest() != x["sha256"]:
+            sys.exit(f"agentmsg: {x['name']} FAILED its sha256 check (store copy changed or corrupt); not writing it")
+        if a.stdout:
+            sys.stdout.buffer.write(data); sys.stdout.flush(); return 0
+        out = os.path.join(a.out or ".", x["name"])
+        if os.path.exists(out) and not a.overwrite:
+            sys.exit(f"agentmsg: {out} exists; use --overwrite or --out DIR")
+        open(out, "wb").write(data)
+        print(f"fetched {x['name']} ({_human_size(len(data))}) -> {out}")
+    return 0
+
+
+def cmd_board(a):
+    """One overwritten entry per agent (not an append log, so it cannot pile up); entries past
+    BOARD_STALE_HOURS are flagged STALE rather than trusted. Awareness only, never a lock."""
+    if a.action == "show":
+        lines = [_board_line(w, e) for w in AGENTS for e in [_board_read(w)] if e]
+        print("\n".join(lines) if lines else "(board empty)")
+        return
+    me = identity(a)
+    path = os.path.join(STORE, "board", f"{me}.json")
+    if a.action == "clear":
+        try:
+            os.remove(path); print(f"board: cleared {me}")
+        except FileNotFoundError:
+            print(f"board: {me} had no entry")
+        return
+    if not (a.doing or "").strip():
+        sys.exit('agentmsg: board set "what you are doing" [--on resource ...]')
+    e = {"agent": me, "doing": a.doing.strip(), "resources": a.on, "ts": now().isoformat(timespec="seconds")}
+    atomic_write(path, e)
+    print(f"board: {_board_line(me, e)}")
+
+
+def cmd_crossings(a):
+    """Measure real crossing: a message sent while its sender still had an unread message from the recipient
+    (unread now, or read only AFTER the send). Needs read_at stamps, so mail read before stamping existed is
+    out of scope rather than guessed. Also summarises guard.log."""
+    cutoff = now() - timedelta(days=a.days)
+    peers = set(WATCHED)
+    msgs = []
+    for root, _d, files in os.walk(os.path.join(STORE, "threads")):
+        for fn in files:
+            if fn.endswith(".json"):
+                try:
+                    m = load(os.path.join(root, fn)); m["_t"] = datetime.fromisoformat(m["ts"]); m["_fn"] = fname(m)
+                except Exception:
+                    continue
+                if m.get("from") in peers and len(m.get("to", [])) <= GUARD_MAX_RECIPIENTS:
+                    msgs.append(m)
+    msgs.sort(key=lambda m: m["_t"])
+
+    def status(recipient, m):
+        if os.path.exists(os.path.join(STORE, "inbox", recipient, m["_fn"])):
+            return "unread", None
+        rp = os.path.join(STORE, "read", recipient, m["_fn"])
+        try:
+            ra = load(rp).get("read_at")
+            return ("read", datetime.fromisoformat(ra)) if ra else ("unknown", None)
+        except Exception:
+            return "unknown", None
+
+    considered, crossed = 0, []
+    for i, b in enumerate(msgs):
+        if b["_t"] < cutoff:
+            continue
+        tos = [r for r in b["to"] if r in peers and r != b["from"]]
+        if not tos:
+            continue
+        considered += 1
+        for x in tos:
+            hit = None
+            for am in msgs[:i]:
+                if am["from"] != x or b["from"] not in am["to"] or am["_t"] >= b["_t"]:
+                    continue
+                st, ra = status(b["from"], am)
+                if st == "unread" or (st == "read" and ra > b["_t"]):
+                    hit = (am, st, ra)
+            if hit:
+                crossed.append((b, hit)); break
+    print(f"crossings, last {a.days}d:\n  conversational messages: {considered}\n"
+          f"  sent while the sender had unread mail from the recipient: {len(crossed)}"
+          + (f" ({100 * len(crossed) / considered:.0f}%)" if considered else ""))
+    counts = {"blocked": 0, "forced": 0, "noted": 0}
+    try:
+        for line in open(os.path.join(STORE, "guard.log")):
+            try:
+                e = json.loads(line)
+                if e.get("action") in counts and datetime.fromisoformat(e["ts"]) >= cutoff:
+                    counts[e["action"]] += 1
+            except Exception:
+                pass
+    except FileNotFoundError:
+        pass
+    print(f"  guard: {counts['blocked']} held, {counts['forced']} forced through, {counts['noted']} soft notes")
+    for b, (am, st, ra) in crossed[-a.list:]:
+        when = "still unread" if st == "unread" else f"read {int((ra - b['_t']).total_seconds())}s AFTER"
+        print(f"    {b['ts']}  {b['from']}->{','.join(b['to'])} [{b['thread']}] {b['id']} crossed {am['id']} ({when})")
+
+
+def cmd_thread(a):
+    td = os.path.join(STORE, "threads", _thread_ok(a.thread))
+    if not os.path.isdir(td):
+        sys.exit(f"agentmsg: no thread '{a.thread}'")
+    msgs = sorted((load(os.path.join(td, f)) for f in os.listdir(td) if f.endswith(".json")), key=lambda m: m["ts"])
+    print(f"=== thread '{a.thread}': {len(msgs)} message(s) (read-only; marks nothing read) ===")
+    for m in msgs:
+        print(f"\n[{m['ts']}] {m['from']}{OWNER_TAG.get(owner_status(m), '')} -> {','.join(m['to'])}"
+              + ("  !URGENT" if m.get("urgent") else "") + f"\n  {m['subject']}")
+        for line in m["body"].splitlines():
+            print(f"    {line}")
+
+
+# Scheduling: a deferred send waits in scheduled/ and is delivered by a timer through the SAME deliver() as an
+# immediate send, so once it lands it is indistinguishable from one. Content is frozen when scheduled.
+_DUR_RE = re.compile(r"^(\d+)([smhd])$")
+
+
+def _deliver_at(a):
+    if bool(a.at) == bool(a.in_dur):
+        sys.exit("agentmsg: schedule needs exactly one of --at <ISO8601> or --in <30m|2h|1d>")
+    if a.at:
+        try:
+            dt = datetime.fromisoformat(a.at)
+        except ValueError:
+            sys.exit(f"agentmsg: --at must be ISO8601, got {a.at!r}")
+        return dt.replace(tzinfo=TZ or now().tzinfo) if dt.tzinfo is None else dt
+    m = _DUR_RE.match(a.in_dur.strip().lower())
+    if not m:
+        sys.exit(f"agentmsg: bad --in duration {a.in_dur!r} (e.g. 30m, 2h, 1d)")
+    return now() + timedelta(seconds=int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)])
+
+
+def cmd_schedule(a):
+    me = sender(a)
+    to = _validate_to(a.to)
+    thread = _thread_ok(a.thread)
+    check_subject(a.subject)
+    _check_stdin_conflict(a)
+    body = read_body(a)
+    files = gather_attachments(a)
+    override = check_payload(me, a, a.subject or "", body, files)
+    guard_crossing(me, to, force=a.force)    # a HOLD must not be dodged by `schedule --in 1m`
+    due = _deliver_at(a)
+    if due <= now():
+        sys.exit(f"agentmsg: {due.isoformat(timespec='seconds')} is not in the future")
+    sid = uuid.uuid4().hex[:6]
+    sa = {"from": me, "to": to, "thread": thread, "subject": a.subject or "", "body": body,
+          "needs_reply": bool(a.needs_reply), "urgent": bool(a.urgent), "in_reply_to": a.in_reply_to}
+    ensure_dirs()
+    if files:
+        sa["attachments"] = store_attachments(sid, files)
+    if override:
+        sa["secret_override"] = override
+    atomic_write(os.path.join(STORE, "scheduled", f"{sid}.json"),
+                 {"id": sid, "deliver_at": due.isoformat(timespec="seconds"), "created_at": now().isoformat(timespec="seconds"), "send_args": sa})
+    print(f"scheduled {sid} -> {','.join(to)} (thread {thread}) for {due.isoformat(timespec='seconds')}")
+
+
+def _scheduled_files():
+    d = os.path.join(STORE, "scheduled")
+    return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".json")) if os.path.isdir(d) else []
+
+
+def cmd_scheduled_list(a):
+    files = _scheduled_files()
+    if not files:
+        print("(no scheduled messages)"); return
+    for p in files:
+        e = load(p); sa = e["send_args"]
+        print(f"  {e['id']}  deliver_at={e['deliver_at']}  {sa['from']}->{','.join(sa['to'])} [{sa['thread']}] {sa['subject']}")
+
+
+def cmd_scheduled_cancel(a):
+    matches = [p for p in _scheduled_files() if os.path.basename(p).startswith(a.id)]
+    if len(matches) != 1:
+        sys.exit(f"agentmsg: '{a.id}' matches {len(matches)} scheduled messages; need exactly one")
+    e = load(matches[0]); os.remove(matches[0])
+    print(f"cancelled scheduled {e['id']} (was due {e['deliver_at']})")
+
+
+def cmd_dispatch_scheduled(a):
+    ensure_dirs()
+    t, n = now(), 0
+    for p in _scheduled_files():
+        try:
+            e = load(p); due = datetime.fromisoformat(e["deliver_at"])
+        except Exception as ex:
+            sys.stderr.write(f"agentmsg: skipping malformed scheduled entry {p}: {ex}\n"); continue
+        if due > t:
+            continue
+        sa = e["send_args"]
+        msg = {"id": e["id"], "from": sa["from"], "to": sa["to"], "thread": sa["thread"], "subject": sa["subject"],
+               "body": sa["body"], "ts": now().isoformat(timespec="seconds"), "needs_reply": bool(sa.get("needs_reply")),
+               "urgent": bool(sa.get("urgent")), "in_reply_to": sa.get("in_reply_to")}
+        for k in ("attachments", "secret_override"):
+            if sa.get(k):
+                msg[k] = sa[k]
+        deliver(msg)
+        os.remove(p); n += 1
+        print(f"dispatched scheduled {e['id']} -> {','.join(sa['to'])}")
+    if a.verbose_noop and not n:
+        print("(nothing due)")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="agentmsg", description="file-backed message bus for agents and one human")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def ident(s):
+        s.add_argument("--from", "--as", dest="frm", help="act as this agent (default $AGENT_NAME)")
+
+    def payload_opts(s):
+        s.add_argument("--attach", action="append", default=[], metavar="PATH")
+        s.add_argument("--attach-stdin", metavar="NAME")
+        s.add_argument("--allow-secret", metavar="REASON")
+        s.add_argument("--allow-large", metavar="REASON")
+
+    def msg_opts(s):
+        s.add_argument("--to", required=True); s.add_argument("--thread", required=True); s.add_argument("--subject")
+        ident(s); s.add_argument("--needs-reply", action="store_true"); s.add_argument("--urgent", action="store_true")
+        s.add_argument("--in-reply-to"); s.add_argument("--force", action="store_true"); s.add_argument("body", nargs="?")
+        payload_opts(s)
+
+    s = sub.add_parser("send"); s.set_defaults(fn=cmd_send); msg_opts(s)
+    s.add_argument("--owner-approval", action="store_true", help="ask the human to approve; held from other recipients until a signed APPROVED")
+    s = sub.add_parser("schedule"); s.set_defaults(fn=cmd_schedule); msg_opts(s)
+    s.add_argument("--at"); s.add_argument("--in", dest="in_dur")
+    s = sub.add_parser("reply"); s.set_defaults(fn=cmd_reply); ident(s); s.add_argument("id")
+    s.add_argument("--needs-reply", action="store_true"); s.add_argument("--urgent", action="store_true")
+    s.add_argument("--force", action="store_true"); s.add_argument("body", nargs="?"); payload_opts(s)
+    s = sub.add_parser("inbox"); s.set_defaults(fn=cmd_inbox); ident(s)
+    s = sub.add_parser("read"); s.set_defaults(fn=cmd_read); ident(s); s.add_argument("id")
+    s = sub.add_parser("thread"); s.set_defaults(fn=cmd_thread); s.add_argument("thread")
+    s = sub.add_parser("verify"); s.set_defaults(fn=cmd_verify); s.add_argument("id")
+    s = sub.add_parser("fetch"); s.set_defaults(fn=cmd_fetch); s.add_argument("id"); s.add_argument("name", nargs="?")
+    s.add_argument("--out"); s.add_argument("--stdout", action="store_true"); s.add_argument("--overwrite", action="store_true")
+    s = sub.add_parser("board"); s.set_defaults(fn=cmd_board); ident(s)
+    s.add_argument("action", nargs="?", choices=["show", "set", "clear"], default="show"); s.add_argument("doing", nargs="?")
+    s.add_argument("--on", action="append", default=[], metavar="RESOURCE")
+    s = sub.add_parser("crossings"); s.set_defaults(fn=cmd_crossings)
+    s.add_argument("--days", type=int, default=7); s.add_argument("--list", type=int, default=5)
+    s = sub.add_parser("announce"); s.set_defaults(fn=cmd_announce); ident(s); s.add_argument("--subject", required=True)
+    s.add_argument("--days", type=int, default=30); s.add_argument("body", nargs="?"); payload_opts(s)
+    s = sub.add_parser("announcements"); s.set_defaults(fn=cmd_announcements); s.add_argument("--full", action="store_true")
+    s = sub.add_parser("announce-sweep"); s.set_defaults(fn=cmd_announce_sweep)
+    s.add_argument("--hours", type=int, default=24); s.add_argument("--dry-run", action="store_true")
+    s = sub.add_parser("scheduled-list"); s.set_defaults(fn=cmd_scheduled_list)
+    s = sub.add_parser("scheduled-cancel"); s.set_defaults(fn=cmd_scheduled_cancel); s.add_argument("id")
+    s = sub.add_parser("dispatch-scheduled"); s.set_defaults(fn=cmd_dispatch_scheduled); s.add_argument("--verbose-noop", action="store_true")
+
+    # `reply ID "body"` with two optional positionals is mis-parsed by argparse before Python 3.12; accept one
+    # leftover non-option word as the body instead of erroring.
+    a, extra = ap.parse_known_args()
+    if extra:
+        if a.cmd == "reply" and a.body is None and len(extra) == 1 and not extra[0].startswith("-"):
+            a.body = extra[0]
+        else:
+            ap.error("unrecognized arguments: " + " ".join(extra))
+    if not AGENTS:
+        sys.exit("agentmsg: no agents configured; set AGENTMSG_AGENTS=a,b,c or write <store>/agents")
+    sys.exit(a.fn(a) or 0)
+
+
+if __name__ == "__main__":
+    main()

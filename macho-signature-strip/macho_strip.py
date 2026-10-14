@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-macho_strip.py — pure-Python Mach-O code signature removal.
+macho_strip.py: pure-Python Mach-O code signature removal.
 
 Equivalent to `codesign --remove-signature` on macOS, but with zero dependency
 on macOS or any Apple toolchain: no `codesign`, no `ldid`, nothing but the
 Python standard library. Works identically on Linux CI runners, which is the
-whole point — re-signing/re-packaging pipelines that build on macOS but
+whole point: re-signing/re-packaging pipelines that build on macOS but
 publish from Linux (or vice versa) need this to behave the same everywhere.
 
 What it does, precisely (matching codesign's own removal steps):
@@ -22,7 +22,7 @@ What it does, precisely (matching codesign's own removal steps):
 There's a fifth step most from-scratch implementations miss: a small
 symbol-table string-padding normalization (see `_normalize_symtab_string_padding`)
 that some re-signing tools' assertion checks are sensitive to. Getting that
-detail right — and PROVING it, not assuming it — is the actual story here;
+detail right (and PROVING it, not assuming it) is the actual story here;
 see the README.
 
 No network calls, no external processes, no writes outside the path you give
@@ -84,7 +84,7 @@ def _normalize_symtab_string_padding(data: bytearray, is_64: bool) -> bytearray:
     LC_SYMTAB string table ends within a small margin of the file's actual
     end (`stroff + strsize >= file_size - 0x10`). Compilers/linkers commonly
     leave a few zero alignment bytes after the string table, and stripping
-    the code signature makes those bytes the new file tail — which can trip
+    the code signature makes those bytes the new file tail, which can trip
     that assertion on an otherwise perfectly valid binary.
 
     This folds harmless trailing zero padding into `strsize` so
@@ -94,7 +94,7 @@ def _normalize_symtab_string_padding(data: bytearray, is_64: bool) -> bytearray:
       - no OTHER load-command-referenced data range extends into the gap
         (symbol table, dyld info, function starts, chained fixups, etc.)
 
-    Silently no-ops (returns `data` unchanged) if any guard fails — this is a
+    Silently no-ops (returns `data` unchanged) if any guard fails: this is a
     compatibility nicety, never something worth risking a corrupt binary over.
     """
     LC_SYMTAB_ = 0x02

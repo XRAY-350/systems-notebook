@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""
+agentmsg-watchd <agent>: an always-on daemon (one per server-side agent, e.g. agentmsg-watch@builder) that
+notices new bus mail and WAKES the agent, from OUTSIDE the agent's own process.
+
+Why a separate daemon: a watcher running inside an agent session gets killed when the session's turn ends,
+so "the agent watches its own inbox" silently stops working. Storage (the bus) and waking (this) are separate jobs.
+
+The two agent-specific pieces are pluggable commands, so this works for any agent runtime:
+  WATCHD_STATE_CMD  prints one word about the agent right now (placeholder {agent}):
+                      idle     resting at its input prompt, safe to type into
+                      working  mid-turn (never interrupt a turn)
+                      dialog   showing something only a human can clear (a confirmation, a menu)
+                      limit    blocked on a usage limit
+                    Unset = always "idle". Only "idle" is ever typed into: an Enter landing in a dialog would
+                    pick an option nobody chose.
+  WATCHD_WAKE_CMD   delivers the nudge text (placeholders {agent} {count} {text}); exit 0 = confirmed delivered.
+                    Unset = print the nudge to stdout (dry run).
+  examples/tmux-state.sh and examples/tmux-wake.sh implement both for an agent CLI running in tmux.
+
+Behaviour, each learned from a real failure:
+  * quiet hours (AGENTMSG_QUIET): non-urgent mail waits; --urgent goes through
+  * re-nudge while mail stays unread, with exponential backoff (5, 10, 20 min ... capped at
+    WATCHD_MAX_BACKOFF_SEC). A fixed 5-minute cadence typed dozens of identical nudges into an agent that was
+    blocked on a usage limit, which then all landed as one giant turn. New mail resets the backoff.
+  * it NEVER stops trying while mail is unread, and it logs a heartbeat at least every 5 minutes. An earlier
+    version gave up after N reminders and logged only when it nudged, so a stuck idle check went silent for
+    19 hours with mail waiting and nothing in the journal.
+  * human alerts (WATCHD_ALERT_TO, comma-separated agents) when mail waits behind a non-idle state, with a
+    threshold per cause (dialog 30 min, limit 60 min, working 6 h), an episode clock that restarts whenever
+    the cause changes, and doubling gaps between repeats. A first version measured from "last seen idle" and
+    alerted instantly after every quiet stretch.
+"""
+import importlib.machinery, importlib.util, os, shlex, subprocess, sys, time, uuid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+_path = os.environ.get("WATCHD_AGENTMSG_PATH", os.path.join(HERE, "agentmsg"))
+_loader = importlib.machinery.SourceFileLoader("agentmsg", _path)        # file has no .py suffix
+am = importlib.util.module_from_spec(importlib.util.spec_from_loader("agentmsg", _loader)); _loader.exec_module(am)
+
+AGENT = sys.argv[1] if len(sys.argv) > 1 else ""
+if AGENT not in am.AGENTS:
+    sys.exit(f"usage: agentmsg-watchd <agent>   (agents: {', '.join(am.AGENTS) or 'none configured'})")
+
+POLL, IDLE_RETRY, HEARTBEAT_SEC = 2, 5, 300
+REMIND_SEC = 300
+MAX_BACKOFF_SEC = int(os.environ.get("WATCHD_MAX_BACKOFF_SEC", 7200))
+ALERT_AFTER = {"dialog": int(os.environ.get("WATCHD_DIALOG_ALERT_SEC", 1800)),
+               "limit": int(os.environ.get("WATCHD_LIMIT_ALERT_SEC", 3600)),
+               "working": int(os.environ.get("WATCHD_WORKING_ALERT_SEC", 21600))}
+ALERT_REPEAT_SEC, ALERT_REPEAT_MAX_SEC = 3600, 43200
+ALERT_TO = [a.strip() for a in os.environ.get("WATCHD_ALERT_TO", "").split(",") if a.strip() and am.known(a.strip())]
+
+
+def log(m):
+    print(f"[watchd:{AGENT}] {m}", flush=True)
+
+
+def files():
+    return am.inbox_files(AGENT)
+
+
+def any_urgent():
+    for p in files():
+        try:
+            if am.load(p).get("urgent"):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def state():
+    cmd = os.environ.get("WATCHD_STATE_CMD")
+    if not cmd:
+        return "idle"
+    try:
+        out = subprocess.run(cmd.format(agent=shlex.quote(AGENT)), shell=True, capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return "unknown"
+    s = (out.strip().split() or ["unknown"])[0].lower()
+    return s if s in ("idle", "working", "dialog", "limit") else "unknown"
+
+
+_ep = {"kind": None, "since": None, "alerts": 0, "last": None}   # one continuous stretch of ONE non-idle cause
+
+
+def _reset_episode():
+    _ep.update(kind=None, since=None, alerts=0, last=None)
+
+
+def _alert(kind, elapsed):
+    """Tell the human through the bus itself (so it reaches the mirror like any message). The text names the
+    CAUSE, never the agent's screen content, which can contain anything. Never allowed to crash the daemon."""
+    if not ALERT_TO:
+        return
+    mins, n = int(elapsed // 60), len(files())
+    why = {"dialog": "is showing a screen only a human can clear", "limit": "is blocked on a usage limit",
+           "working": "has been mid-turn the whole time"}[kind]
+    try:
+        am.ensure_dirs()
+        am.deliver({"id": uuid.uuid4().hex[:6], "from": AGENT, "to": ALERT_TO, "thread": f"{AGENT}-stuck",
+                    "subject": f"{AGENT}: {n} message(s) waiting {mins} min; it {why}",
+                    "body": f"{AGENT} has had {n} unread message(s) for {mins} min and {why}. The watcher will not type into "
+                            f"a non-idle agent. Repeats with doubling gaps while this lasts; stops once it is idle.",
+                    "ts": am.now().isoformat(timespec="seconds"), "needs_reply": False,
+                    "urgent": kind == "dialog", "in_reply_to": None})
+        log(f"ALERT ({kind}) sent: {mins} min, {n} pending")
+    except Exception as e:
+        log(f"alert failed: {e}")
+
+
+def check_idle():
+    s = state()
+    if s == "idle":
+        _reset_episode(); return True
+    if s not in ALERT_AFTER:
+        _reset_episode(); return False
+    t = time.monotonic()
+    if _ep["kind"] != s:
+        _ep.update(kind=s, since=t, alerts=0, last=None); return False
+    elapsed = t - _ep["since"]
+    if elapsed >= ALERT_AFTER[s]:
+        gap = min(ALERT_REPEAT_SEC * 2 ** max(_ep["alerts"] - 1, 0), ALERT_REPEAT_MAX_SEC)
+        if _ep["last"] is None or t - _ep["last"] >= gap:
+            _alert(s, elapsed); _ep["alerts"] += 1; _ep["last"] = t
+    return False
+
+
+def nudge(n):
+    text = f"[bus] {n} new message(s) waiting. Run: AGENT_NAME={AGENT} agentmsg inbox (then read/reply)."
+    cmd = os.environ.get("WATCHD_WAKE_CMD")
+    if not cmd:
+        print(text, flush=True); return True
+    try:
+        ok = subprocess.run(cmd.format(agent=shlex.quote(AGENT), count=n, text=shlex.quote(text)),
+                            shell=True, timeout=60).returncode == 0
+    except Exception:
+        ok = False
+    log(f"nudged ({n} msg), " + ("confirmed delivered" if ok else "NOT confirmed (will retry on the backoff)"))
+    return ok
+
+
+def held_by_quiet():
+    return am.in_quiet_hours(am.now()) and not any_urgent()
+
+
+def main():
+    am.ensure_dirs()
+    log(f"started; polling every {POLL}s (idle-gated nudges)")
+    while True:
+        while not files():
+            time.sleep(POLL)
+        while files() and held_by_quiet():
+            time.sleep(min(am.quiet_hold_seconds(am.now()), 5))
+        _reset_episode()                      # a new pending-mail episode never inherits an old clock
+        last_hb = time.monotonic()
+        while files() and not check_idle():   # wait for idle; never type into a turn or a dialog
+            if time.monotonic() - last_hb >= HEARTBEAT_SEC:
+                log(f"not idle [{_ep['kind'] or 'unknown'}], deferring ({len(files())} pending)"); last_hb = time.monotonic()
+            time.sleep(IDLE_RETRY)
+        if files():
+            nudge(len(files()))
+        ticks, reminders, last_hb, seen = 0, 0, time.monotonic(), set(files())
+        while files():
+            time.sleep(POLL); ticks += POLL
+            cur = set(files())
+            if cur - seen:                    # new mail: a new unread set, so reset the backoff and nudge soon
+                reminders, ticks = 0, REMIND_SEC
+            seen = cur
+            interval = min(REMIND_SEC * 2 ** reminders, MAX_BACKOFF_SEC)
+            if ticks >= interval:
+                ticks = 0
+                quiet = held_by_quiet()
+                if not quiet and check_idle():
+                    nudge(len(files())); reminders += 1
+                else:
+                    log(f"reminder deferred ({'quiet hours' if quiet else 'not idle [' + str(_ep['kind']) + ']'}), {len(files())} pending")
+                last_hb = time.monotonic()
+            elif time.monotonic() - last_hb >= HEARTBEAT_SEC:
+                log(f"heartbeat: {len(files())} pending, {reminders} reminder(s), next check in ~{max(0, interval - ticks)}s")
+                last_hb = time.monotonic()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

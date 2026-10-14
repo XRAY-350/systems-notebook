@@ -1,0 +1,7 @@
+{
+  "_comment": "Least privilege for the hub session: it may list and message sessions, nothing else.",
+  "permissions": {
+    "allow": ["ListSessions", "SendMessage"],
+    "deny": ["Bash", "Write", "Edit", "WebFetch", "WebSearch"]
+  }
+}

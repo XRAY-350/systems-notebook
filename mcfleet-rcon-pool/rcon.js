@@ -1,4 +1,4 @@
-// rcon.js — persistent RCON client for mcfleet-web.
+// rcon.js: persistent RCON client for mcfleet-web.
 //
 // WHY: the live-map /positions endpoint used to shell out to `python mc_rcon.py` on every poll
 // (~1/sec per viewer, 3 calls each for Pos/Dimension/Rotation). Each shell-out spawned a python
@@ -8,7 +8,7 @@
 // so the server logs a single connection instead of thousands.
 //
 // Model (matches mc_rcon.py's proven framing): one command in flight at a time per server; each
-// request maps 1:1 to the next reply packet (our commands — list, data get — are small,
+// request maps 1:1 to the next reply packet (our commands, list and data get, are small,
 // single-packet responses). Auto-reconnect + re-auth on drop; a dropped socket just fails the
 // current poll (the map skips one frame) and the next call reconnects.
 const net = require('net');

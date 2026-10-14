@@ -4,10 +4,10 @@
 Why: the version poller fans ~13 apps x up to 57 countries out through concurrent ThreadPools, so Apple
 sees a ~400-wide burst and 403/429-blocks the runner IP. A single process-global token bucket keyed by
 domain-group ("apple") meters EVERY Apple request through one gate, turning the burst into a smooth,
-safe stream — pacing *preventively* instead of the old reactive back-off-after-you're-blocked.
+safe stream, pacing *preventively* instead of the old reactive back-off-after-you're-blocked.
 
 Three modes via env GOVERNOR_MODE:
-  off     no-op passthrough — today's behaviour byte-for-byte (default until validated)
+  off     no-op passthrough: today's behaviour byte-for-byte (default until validated)
   shadow  compute the pacing decision + log what it WOULD do, but NEVER block (secondary/validation run)
   on      enforce: block callers until a token is available
 
@@ -17,7 +17,7 @@ The allowed rate self-tunes with AIMD from Apple's 403/429 feedback (see on_clea
 
 State (a GCRA 'theoretical arrival time' cursor per group + learned rate_per_min) persists in the
 runner-local poll heartbeat so it carries across the per-minute fresh-process runs and keeps learning.
-Fail-open: any internal error logs and lets the request proceed — a governor bug must never take the
+Fail-open: any internal error logs and lets the request proceed: a governor bug must never take the
 poller down. A per-group semaphore (MAX_CONCURRENCY) also bounds how many callers can be inside
 acquire() at once, as a resource-usage cap (GCRA itself is already accurate regardless of concurrency).
 """
@@ -39,7 +39,7 @@ AIMD_INCREMENT = 5.0     # +req/min per clean run
 AIMD_DECREASE = 0.5      # xrate on any 403/429
 BURST = 30.0             # max tokens the bucket can hold (small burst allowance)
 # Glide-mode reactive pause floor: once AIMD's multiplicative-decrease has dragged the rate down to this
-# fraction of the ceiling, stop polling entirely (a real pause) instead of limping on — below it Apple is
+# fraction of the ceiling, stop polling entirely (a real pause) instead of limping on; below it Apple is
 # clearly hard-blocking and low-rate polling just sustains it. The "levels" are the rate itself; this is
 # the single terminal pause. Env-tunable. Default ~12% (e.g. 75/min at a 600 ceiling).
 PAUSE_FRAC = float(os.environ.get("GOVERNOR_PAUSE_FRAC", "0.125"))
@@ -213,7 +213,7 @@ class RateGovernor:
             if self._mode == "on" and block and wait > 0:
                 self._sleep(wait)
             return wait
-        except Exception as e:   # fail-open — never break the poller
+        except Exception as e:   # fail-open: never break the poller
             print(f"  [governor] acquire error (proceeding): {e}", file=sys.stderr)
             return 0.0
         finally:
@@ -239,12 +239,12 @@ class RateGovernor:
             print(f"  [governor] on_rate_limited error: {e}", file=sys.stderr)
 
     def dampen(self, group="apple", factor=0.5):
-        """PREEMPTIVE rate cut — distinct from on_rate_limited(), which only fires reactively after a
+        """PREEMPTIVE rate cut: distinct from on_rate_limited(), which only fires reactively after a
         real 403/429. Called when a predictive signal (recent-volume trajectory, historically-risky
         day/hour bucket) suggests a rate-limit is likely before Apple has actually returned one, so a
         gentler single cut is applied instead of waiting to hit the wall. `factor` defaults softer
         than on_rate_limited's AIMD_DECREASE (0.5 vs 0.5 is the same magnitude here deliberately for
-        the first version — tune independently via the caller once there's real shadow-mode data to
+        the first version; tune independently via the caller once there's real shadow-mode data to
         judge against)."""
         try:
             self._load()

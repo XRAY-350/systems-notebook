@@ -1,7 +1,7 @@
 # gated-auto-update
 
 A human-approve-once, apply-when-safe update state machine: check for updates, require a single
-human approval, then apply automatically the next time the system is in a safe state — with a
+human approval, then apply automatically the next time the system is in a safe state, with a
 hard guard against auto-applying a real version migration, and treating a failed apply's automatic
 rollback as a normal, terminal (not error) outcome.
 
@@ -30,7 +30,7 @@ fully testable with zero real subprocesses, files, or a live server anywhere nea
 
 ## Why "approve once," not "approve this specific apply"
 
-The naive design — notify, human approves, apply immediately — doesn't fit a live system that
+The naive design (notify, human approves, apply immediately) doesn't fit a live system that
 can't tolerate downtime whenever it happens to be convenient for a human to click a button. This
 decouples the human decision (should these changes be applied AT ALL) from the system's own
 judgment about WHEN it's actually safe to touch anything. One approval "arms" the plan; a separate,
@@ -41,19 +41,19 @@ hours after the approval.
 
 Not every "update" is the same kind of decision. A routine version bump within the same major
 version is safe to fully automate. A cutover to a different target version entirely is a
-deliberate, by-hand decision — the two can look identical in a raw diff (both are "a version
+deliberate, by-hand decision: the two can look identical in a raw diff (both are "a version
 number changed") but carry very different risk. `checkMigrationGuard` runs on every single apply
 attempt, not just the first one after approval, specifically so that staying armed for a long time
 (waiting for a safe window) can never quietly turn a migration into something that slips through
-on a technicality — if the guard would refuse it now, it refuses it every time, and disarms rather
+on a technicality: if the guard would refuse it now, it refuses it every time, and disarms rather
 than leaving a refused plan sitting there to be retried forever.
 
 ## Deferred vs. terminal, and why that distinction matters
 
 `deferred` (the safe window closed in the narrow gap between checking it and actually starting the
-apply — a real race, not a hypothetical one) is the ONLY outcome that leaves the plan armed to
+apply: a real race, not a hypothetical one) is the ONLY outcome that leaves the plan armed to
 retry. `success` and `rolled_back` are both terminal: either the change landed, or it failed and
-was safely undone, and in both cases there's nothing left to apply — leaving the plan armed after
+was safely undone, and in both cases there's nothing left to apply, leaving the plan armed after
 either would mean silently retrying something that already reached a real conclusion.
 
 ## Verified

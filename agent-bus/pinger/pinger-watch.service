@@ -1,0 +1,14 @@
+[Unit]
+Description=agent-bus pinger watcher: hands a RELAY line to the pinger session when a laptop lane gets mail
+
+[Service]
+User=agentbus
+EnvironmentFile=/etc/agentmsg.env
+Environment=PINGER_STATE_CMD=/usr/local/lib/agent-bus/examples/tmux-state.sh pinger
+Environment=PINGER_WAKE_CMD=/usr/local/lib/agent-bus/examples/tmux-wake.sh pinger {text}
+ExecStart=/usr/bin/python3 /usr/local/lib/agent-bus/pinger/pinger_watch.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

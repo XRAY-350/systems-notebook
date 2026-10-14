@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily announcement sweep, outside quiet hours
+
+[Timer]
+OnCalendar=*-*-* 12:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

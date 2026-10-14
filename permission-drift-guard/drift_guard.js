@@ -1,5 +1,5 @@
 /**
- * drift_guard.js — periodic access-control drift detection against a golden manifest, with
+ * drift_guard.js: periodic access-control drift detection against a golden manifest, with
  * DIFFERENT trust tiers for different kinds of changes.
  *
  * This is a standalone, generalized re-implementation of the core algorithm behind a permission
@@ -9,14 +9,14 @@
  * problem and the fix are unchanged; see README.md for the real incident that caused this to
  * exist.
  *
- * Model: a "resource" (e.g. a channel, a folder, an endpoint) has a set of "overwrites" — explicit
+ * Model: a "resource" (e.g. a channel, a folder, an endpoint) has a set of "overwrites": explicit
  * grants/denials layered on top of a default. Overwrites come in two kinds:
  *   - SYSTEM-tier (e.g. a role-based grant): expected to be stable and owner-controlled. Any drift
  *     here is very likely accidental or malicious, so it's safe to auto-correct back to the golden
  *     manifest.
  *   - USER-tier (e.g. a one-off grant to a specific account): far more likely to be a deliberate,
  *     still-valid special case added AFTER the manifest snapshot was taken (an integration, a
- *     one-off exception). Auto-reverting those risks undoing something that was meant to stay —
+ *     one-off exception). Auto-reverting those risks undoing something that was meant to stay,
  *     so these are only ever REPORTED, never auto-corrected.
  */
 
@@ -27,8 +27,8 @@ const USER = "user";
  * @param {object} manifest  { [resourceId]: { overwrites: [{ id, tier, allow: string[], deny: string[] }] } }
  * @param {object} live      same shape, the current real state
  * @returns {{ corrections: object[], reports: object[] }}
- *   corrections — SYSTEM-tier drift found (id + what it should be, for the caller to actually apply)
- *   reports     — USER-tier drift found (never auto-applied, surfaced for a human to review)
+ *   corrections: SYSTEM-tier drift found (id + what it should be, for the caller to actually apply)
+ *   reports:     USER-tier drift found (never auto-applied, surfaced for a human to review)
  */
 function computeDrift(manifest, live) {
   const corrections = [];
@@ -37,7 +37,7 @@ function computeDrift(manifest, live) {
   for (const [resourceId, goldenEntry] of Object.entries(manifest)) {
     const liveEntry = live[resourceId];
     if (!liveEntry) {
-      // Whole resource missing from live state entirely — always worth surfacing, regardless of tier.
+      // Whole resource missing from live state entirely: always worth surfacing, regardless of tier.
       reports.push({ resourceId, kind: "resource-missing" });
       continue;
     }
@@ -64,7 +64,7 @@ function computeDrift(manifest, live) {
       if (goldenById.has(id)) continue;
       const delta = { resourceId, overwriteId: id, tier: current.tier, golden: null, current };
       // A brand-new overwrite has no golden entry to compare tiers against by definition here, so
-      // this uses the LIVE entry's own tier — a new system-tier grant appearing (e.g. a role
+      // this uses the LIVE entry's own tier: a new system-tier grant appearing (e.g. a role
       // suddenly given permissions nobody granted) is exactly the class of thing worth
       // auto-reverting; a new user-tier grant is exactly the "probably deliberate" case.
       if (current.tier === SYSTEM) {

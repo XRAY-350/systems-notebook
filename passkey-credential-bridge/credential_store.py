@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-credential_store.py — one shared WebAuthn (passkey) credential file, readable
+credential_store.py: one shared WebAuthn (passkey) credential file, readable
 and writable by two independently-built web apps that each expect a different
 JSON shape for the same underlying data.
 

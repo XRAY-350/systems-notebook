@@ -1,0 +1,20 @@
+{
+  "_doc": "Who is told when a pipeline step fails. 'phases' overrides 'default' per step; 'shared' owners are added when the log matches shared_error_pattern; confirmed=false means a proposal, so the default owner gets it instead.",
+  "default": ["pipeline-owner"],
+  "shared_error_pattern": "CoreKit[^\\n]*(error:|fatal error|Undefined symbols)|(error:|fatal error)[^\\n]*CoreKit|referenced from:\\s*\\n[^\\n]*\\bin CoreKit[-.][^\\n]*\\.o\\b",
+  "apps": {
+    "com.example.puzzle": {
+      "confirmed": true,
+      "phases": {"PATCH": ["puzzle-mod-owner"], "BUILD": ["puzzle-mod-owner"]},
+      "shared": ["corekit-owner"]
+    },
+    "com.example.reader": {
+      "confirmed": true,
+      "phases": {"PATCH": ["reader-mod-owner"]}
+    },
+    "com.example.racer": {
+      "confirmed": false,
+      "phases": {"PATCH": ["racer-mod-owner"]}
+    }
+  }
+}

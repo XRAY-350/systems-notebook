@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly fresh conversation for the pinger (clear, not restart), before quiet hours
+
+[Timer]
+OnCalendar=*-*-* 02:40:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

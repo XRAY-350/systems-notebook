@@ -1,7 +1,7 @@
 # format-era-migrator
 
 Parse a command written in one of several historical format "eras," detected from its own syntax
-shape, into an era-agnostic intermediate representation — then recompile it in ANY target era,
+shape, into an era-agnostic intermediate representation, then recompile it in ANY target era,
 with explicit tracking of anything that can't be represented there.
 
 ```js
@@ -22,8 +22,8 @@ runnable and testable entirely on its own.
 ## The actual problem
 
 Three sequential format eras means a naive "convert A to B" function only solves one of the three
-real conversion directions people actually want (old→new, new→old, and — since players share
-commands across communities running different versions — middle-era→either end). Writing that as
+real conversion directions people actually want (old→new, new→old, and, since players share
+commands across communities running different versions, middle-era→either end). Writing that as
 N×N pairwise converters duplicates the same field-mapping logic three-to-six times and gets worse
 every time the game adds a fourth era.
 
@@ -31,8 +31,8 @@ every time the game adds a fourth era.
 
 Parse INTO a single era-agnostic intermediate spec once, regardless of source era, then compile
 FROM that spec into any target era. Adding support for converting between any two eras is then
-"can this spec's fields be parsed from era X" and "can this spec's fields be compiled to era Y" —
-independent concerns, each written once — rather than a combinatorial explosion of pairwise
+"can this spec's fields be parsed from era X" and "can this spec's fields be compiled to era Y":
+independent concerns, each written once, rather than a combinatorial explosion of pairwise
 converters.
 
 ## Being honest about lossy conversions

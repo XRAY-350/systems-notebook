@@ -1,0 +1,7 @@
+[Unit]
+Description=Fresh conversation for the pinger session (same process, same registration)
+
+[Service]
+Type=oneshot
+User=agentbus
+ExecStart=/usr/local/lib/agent-bus/pinger/pinger-clear.sh

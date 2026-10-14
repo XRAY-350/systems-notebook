@@ -1,0 +1,9 @@
+[Unit]
+Description=Deliver soon-expiring announcements as real mail to agents that have not seen them
+
+[Service]
+Type=oneshot
+User=agentbus
+EnvironmentFile=/etc/agentmsg.env
+Environment=AGENTMSG_NO_MIRROR=1
+ExecStart=/usr/local/bin/agentmsg announce-sweep
