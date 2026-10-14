@@ -16,12 +16,12 @@ The original implementation shelled out to a small Python RCON script on every s
 which meant spawning a brand-new process AND opening a brand-new authenticated RCON connection for
 every query, all day, for as long as anyone had the map open.
 
-It went unnoticed as a *functional* bug: positions displayed fine, nothing looked broken. It was
-only caught by actually reading the server's own log volume rather than trusting that "no errors"
-meant "no problem": **86% of the server's total log output turned out to be RCON connect/disconnect
-churn**, not gameplay. Roughly sixty processes a minute were being spawned on a box that was already
-resource-constrained, for zero functional benefit: the connection was authenticated, used once,
-and thrown away, every single time.
+It went unnoticed as a *functional* bug: positions displayed fine, nothing looked broken. I caught
+it by reading the server's own log rather than trusting that "no errors" meant "no problem": 6,682
+of its 7,742 lines (about 86%) were RCON connect/disconnect churn, not gameplay, at roughly 65 new
+connections a minute per viewer. Each one was authenticated, used once, and thrown away. I asked
+whether the connection could stay open instead; an AI agent traced the flood to the map endpoint and
+built the client below.
 
 ## The fix
 
@@ -32,8 +32,9 @@ authenticated connection per server, reused across every command through a singl
 than trying to multiplex a protocol that doesn't support it).
 
 Verified directly against real traffic: sixteen RCON commands issued back to back produced exactly
-one logged connection in the server's own log, down from sixteen; the fix eliminates the churn at
-the source rather than filtering it out downstream.
+one logged connection in the server's own log, down from sixteen. Live, RCON connects dropped from
+about 65 a minute per viewer to about 2 a minute (the one remaining poller); the fix eliminates the
+churn at the source rather than filtering it out downstream.
 
 ## Design notes
 
