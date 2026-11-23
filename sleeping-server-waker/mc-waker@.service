@@ -1,0 +1,53 @@
+[Unit]
+Description=Minecraft waker for %i (answers pings while %i sleeps; a join attempt wakes it)
+Documentation=file:/usr/local/lib/mc-waker/README.md
+# Instance %i = server id. NOT Conflicts= with the server: Conflicts would STOP a running server when the waker
+# starts (found live on a production server). Instead the server's own ExecStartPre stops mc-waker@<id>, and this unit refuses to start
+# unless the server is genuinely down (ExecCondition below), so it can never touch a live server.
+ConditionPathExists=!/srv/minecraft/.%i_sleep_disabled
+# Fail fast (and visibly) if the instance has no env file, rather than running with missing ports.
+AssertPathExists=/etc/mc-waker/%i.env
+
+[Service]
+Type=simple
+DynamicUser=yes
+EnvironmentFile=/etc/mc-waker/%i.env
+# The condition is a script, not inline sh: it reads WAKER_UNIT from its environment (EnvironmentFile= applies to
+# ExecCondition= too) AND falls back to parsing the env file itself, then to %i.service, so it never depends on how
+# systemd expands $VARS in a command line. '+' = runs as root, outside the sandbox (needs systemctl).
+# Exit 0 = server inactive/failed -> start the waker; exit 1 = server up/activating -> skip quietly (not a failure).
+ExecCondition=+/usr/local/lib/mc-waker/mc_waker_condition.sh %i
+ExecStart=/usr/bin/python3 /usr/local/lib/mc-waker/mc_waker.py
+Environment=WAKER_ID=%i
+# Wake flag lands in /run/mc-waker-%i/wake (a root mc-wake@%i.path unit watches it and starts the server). Preserve=yes keeps the cooldown
+# stamp (last_wake) and per-IP counts (ip_attempts.json) across waker restarts and server start/stop cycles.
+RuntimeDirectory=mc-waker-%i
+RuntimeDirectoryPreserve=yes
+# Default credential paths: one folder per server id under /srv/minecraft. A server whose
+# files live elsewhere overrides BOTH lines in a drop-in (an empty LoadCredential= resets the list first), e.g.
+#   /etc/systemd/system/mc-waker@survival.service.d/paths.conf:
+#     [Service]
+#     LoadCredential=
+#     LoadCredential=whitelist:/opt/survival/whitelist.json
+#     LoadCredential=server.properties:/opt/survival/server.properties
+# Both files must exist (systemd fails the start with status 243/CREDENTIALS if one is missing); Minecraft creates
+# both on first start. The waker reads them read-only from $CREDENTIALS_DIRECTORY, never from /home (ProtectHome).
+LoadCredential=whitelist:/srv/minecraft/%i/whitelist.json
+LoadCredential=server.properties:/srv/minecraft/%i/server.properties
+Restart=on-failure
+RestartSec=5
+# hardening: parses untrusted network input
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+MemoryMax=128M

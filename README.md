@@ -32,6 +32,7 @@ copyright complications to work around in how it's described.
 | [`mcfleet-backup-retention/`](mcfleet-backup-retention/) | A 26-line grandfather-father-son backup retention policy, implemented as a pure stdin-filenames-in / stdout-delete-list-out filter. Validated against a synthetic 480-file, 40-day dataset before ever being trusted on real backups. |
 | [`gated-auto-update/`](gated-auto-update/) | A human-approve-once, apply-when-safe update state machine, generalized from a mod auto-updater: check for updates, one human click arms the plan, apply automatically the next safe window, with a hard guard against ever auto-applying a real version migration, and a failed apply's auto-rollback treated as a normal terminal outcome, not an error to keep retrying. |
 | [`format-era-migrator/`](format-era-migrator/) | Parse a command written in one of several historical, syntactically-different format eras into an era-agnostic spec, then recompile it in any target era; generalized from a command converter covering 22 Minecraft versions across 3 real historical data-format eras, with explicit tracking of anything a lossy conversion can't carry over. |
+| [`sleeping-server-waker/`](sleeping-server-waker/) | Stop a game server when it's empty and start it the moment a real player tries to join. An unprivileged listener holds the ports, answers the server list for both client families (Java, Bedrock RakNet, Bedrock NetherNet over HTTP/1.1 and HTTP/2), and on a genuine join drops a flag for a root unit to act on. A scanner guard (strict parse, per-IP budget, cooldown), and a known-players mode after all eight wakes of one public server turned out to be bots. 49 protocol checks. |
 
 **Community Platform** (moderation + engagement bot, two live communities)
 | Module | What it is |
@@ -47,6 +48,7 @@ copyright complications to work around in how it's described.
 | Module | What it is |
 |---|---|
 | [`declarative-drift-reconciler/`](declarative-drift-reconciler/) | Declarative "does live state match its source of truth" checking with self-heal and a three-tier (confirmed-correct / couldn't-check / confirmed-wrong) report, instead of collapsing everything into a single pass/fail. The pattern that caught a real CI runner misconfiguration that looked, for 48 hours, like six unrelated failures. |
+| [`forced-command-gate/`](forced-command-gate/) | Let one machine ask another to do a few named things as root without a root shell: an SSH forced command with literal verb allowlists, no shell anywhere, secrets on stdin only, and an exit code that tells "refused" from "failed". Plus the fix for a bug class an agent review found: root code following a planted symlink or hard link in a directory a less-trusted account can write. 41 hostile requests refused, and every protection removed in turn makes a test fail. |
 
 **Admin Control Plane** (passkey-gated ops surface + remote terminal)
 | Module | What it is |
