@@ -43,6 +43,7 @@ copyright complications to work around in how it's described.
 | Module | What it is |
 |---|---|
 | [`agent-bus/`](agent-bus/) | The whole coordination layer: a file-based message bus with a send-time crossing guard (measured first: 28% of 828 messages were a sender talking past an unanswered reply), wake daemons kept separate from storage, the human's own decisions cryptographically signed so a relayed "the human said yes" is never mistaken for one, a mirror that blocks credentials before they are published, a pinger and a laptop-side relay hub that wake sessions the server cannot reach, and an orchestrator that collects everything waiting on the human into one digest. 49 end-to-end checks, plus a mutation mode that proves the signature tests can fail. |
+| [`held-owner-approvals/`](held-owner-approvals/) | Ask the human once and wake the other agents only after a signed yes: a request that must name its action, targets and operation is held from every recipient's inbox until the human's signed answer releases it (first answer decides, once; forged or relayed answers release nothing), each approval usable once for its own action, a release-first order plus catch-up sweep after a real approval was stored but never acted on, and the shared board (claims that warn but don't lock, questions that are never joined automatically). 15 tests, six mutations caught. |
 
 **Infrastructure & Recovery**
 | Module | What it is |
