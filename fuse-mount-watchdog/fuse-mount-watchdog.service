@@ -1,0 +1,11 @@
+[Unit]
+Description=Detect and self-heal a wedged SSHFS mount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fuse-mount-watchdog.sh
+# The script deliberately LEAVES a background canary stat running, to be judged on the NEXT run. With the default
+# KillMode=control-group, systemd tries to kill it when this oneshot exits; a canary stuck on a wedged mount can't be
+# killed, so the unit sat in its stop phase for minutes and the next (healing) run couldn't start.
+KillMode=process
+#Environment=NOTIFY_CMD=/usr/local/bin/notify-chat
