@@ -49,6 +49,7 @@ copyright complications to work around in how it's described.
 | Module | What it is |
 |---|---|
 | [`declarative-drift-reconciler/`](declarative-drift-reconciler/) | Declarative "does live state match its source of truth" checking with self-heal and a three-tier (confirmed-correct / couldn't-check / confirmed-wrong) report, instead of collapsing everything into a single pass/fail. The pattern that caught a real CI runner misconfiguration that looked, for 48 hours, like six unrelated failures. |
+| [`cross-box-benchmark/`](cross-box-benchmark/) | The same short CPU, disk and network benchmark on every box, a passive steal/pressure sampler, and a compare tool that refuses mismatched runs and warns when a baseline was measured busy. Built for a host move, where the first report's 1.59x single-thread gain shrank to a fair 1.26x once the old machine was re-measured idle. |
 | [`forced-command-gate/`](forced-command-gate/) | Let one machine ask another to do a few named things as root without a root shell: an SSH forced command with literal verb allowlists, no shell anywhere, secrets on stdin only, and an exit code that tells "refused" from "failed". Plus the fix for a bug class an agent review found: root code following a planted symlink or hard link in a directory a less-trusted account can write. 41 hostile requests refused, and every protection removed in turn makes a test fail. |
 
 **Admin Control Plane** (passkey-gated ops surface + remote terminal)
